@@ -29,7 +29,7 @@ struct MacrosPage: View {
             if selection == nil { model.selectedMacro = names.first }
             nameDraft = selection ?? ""
         }
-        .onChange(of: model.selectedMacro) { _ in
+        .onChange(of: model.selectedMacro) {
             capture.stop()
             nameDraft = selection ?? ""
         }
@@ -152,7 +152,7 @@ struct MacrosPage: View {
                     .font(.system(size: 22, weight: .bold))
                     .focused($nameFocused)
                     .onSubmit { commitName(name) }
-                    .onChange(of: nameFocused) { if !$0 { commitName(name) } }
+                    .onChange(of: nameFocused) { _, focused in if !focused { commitName(name) } }
                 Button {
                     testCountdown = 3
                     tick(name)

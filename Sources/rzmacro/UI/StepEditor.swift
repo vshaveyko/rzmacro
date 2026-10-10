@@ -163,12 +163,12 @@ private struct LightWordsField: View {
             }
             TextField("static #ff8800", text: $draft)
                 .field(monospaced: true)
-                .onChange(of: draft) { if isValid($0) && $0 != words { onChange($0) } }
+                .onChange(of: draft) { _, new in if isValid(new) && new != words { onChange(new) } }
             if !isValid(draft) {
                 Text("Not a lighting command — pick one above.").font(.system(size: 11)).foregroundStyle(Theme.danger)
             }
         }
         .onAppear { draft = words }
-        .onChange(of: words) { if $0 != draft { draft = $0 } }
+        .onChange(of: words) { _, new in if new != draft { draft = new } }
     }
 }
