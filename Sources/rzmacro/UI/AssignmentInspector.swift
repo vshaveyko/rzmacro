@@ -4,11 +4,11 @@ import SwiftUI
 struct AssignmentInspector: View {
     @ObservedObject var model: AppModel
     let key: DeviceKey
-    /// Bundle identifier of the app profile being edited; nil is "all apps".
+    /// The profile being edited; nil is the default bindings.
     let profile: String?
 
     enum ActionKind: String, CaseIterable, Identifiable {
-        case shortcut, macro, text, app, open, media, click, light, shell, disabled
+        case shortcut, macro, text, app, open, media, click, light, shell, profile, disabled
 
         var id: String { rawValue }
 
@@ -23,6 +23,7 @@ struct AssignmentInspector: View {
             case .click: return "Click"
             case .light: return "Light"
             case .shell: return "Shell"
+            case .profile: return "Profile"
             case .disabled: return "Off"
             }
         }
@@ -38,6 +39,7 @@ struct AssignmentInspector: View {
             case .click: return "Click a mouse button"
             case .light: return "Change the lighting"
             case .shell: return "Run a shell command"
+            case .profile: return "Switch to another profile"
             case .disabled: return "The button does nothing at all"
             }
         }
@@ -55,6 +57,7 @@ struct AssignmentInspector: View {
             case .click: return .click
             case .light: return .light
             case .shell: return .shell
+            case .profile: return .profile
             case .disabled: return nil
             }
         }
@@ -74,6 +77,7 @@ struct AssignmentInspector: View {
             case .media: self = .media
             case .click: self = .click
             case .light: self = .light
+            case .profile: self = .profile
             case .down, .up, .delay: return nil
             }
         }
@@ -116,7 +120,8 @@ struct AssignmentInspector: View {
         default:
             guard let stepKind = new.stepKind else { return }
             armShortcut = new == .shortcut
-            set(Assignment(steps: [stepKind.makeStep(macros: macroNames)]))
+            // A key given a key is that key for as long as it is held, unless told otherwise.
+            set(Assignment(steps: [stepKind.makeStep(macros: macroNames)], hold: new == .shortcut && key.trigger.isOrdinaryKey))
         }
     }
 
@@ -124,8 +129,8 @@ struct AssignmentInspector: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
-                if let profile, assignment == nil, let inherited = model.assignment(for: key.trigger, profile: nil) {
-                    Label("In \(AppModel.appName(profile)) this button still does what it does everywhere (\(inherited.summary)). Choose an action to override it.", systemImage: "arrow.turn.down.right")
+                if let profile, assignment == nil, let inherited = model.effective(key.trigger, profile: profile) {
+                    Label("In \(profile) this button does what \(inherited.from ?? Profile.defaultName) says (\(inherited.assignment.summary)). Choose an action to change it here.", systemImage: "arrow.turn.down.right")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -205,10 +210,16 @@ struct AssignmentInspector: View {
             default:
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(kind.title)
-                    StepValueEditor(step: step, macroNames: macroNames, roomy: true, recordOnAppear: armShortcut) { new in
+                    StepValueEditor(step: step, macroNames: macroNames, profileNames: model.config.profiles.map(\.name), roomy: true, recordOnAppear: armShortcut) { new in
                         update { $0.steps = [new] }
                     }
-                    if kind == .shortcut || kind == .text { keySpeedNote }
+                    if kind == .profile {
+                        Text("Profiles are made, and told when to switch on by themselves, on the Profiles page.")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(Theme.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if (kind == .shortcut || kind == .text) && !isPlainSwap { keySpeedNote }
                 }
             }
         } else if kind == .disabled {
@@ -271,6 +282,9 @@ struct AssignmentInspector: View {
             }
         }
     }
+
+    /// A keyboard key that simply is another key: the keyboard driver's work, not the macro engine's.
+    private var isPlainSwap: Bool { key.trigger.isOrdinaryKey && assignment?.remapTarget != nil }
 
     /// For actions that press keys directly: says how fast, and where that is chosen.
     private var keySpeedNote: some View {
@@ -384,7 +398,9 @@ struct AssignmentInspector: View {
                     .toggleStyle(.checkbox)
                     .font(.system(size: 12))
             case .hold:
-                Text("The keys stay down for as long as the button is held — a thumb button can be Shift.")
+                Text(isPlainSwap
+                     ? "The key simply becomes that key. The keyboard driver makes the swap, so it works everywhere — games, password fields — and repeats when held, like the real one."
+                     : "The keys stay down for as long as the button is held — a thumb button can be Shift.")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)

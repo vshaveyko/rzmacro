@@ -1,14 +1,17 @@
 import SwiftUI
 
-/// A drawing of a device with its special buttons clickable. It is built from the profile's
-/// button list — a column of macro keys, a volume roller, a thumb grid — so it fits any model
-/// that has those, and it glows with the current lighting effect.
+/// A drawing of a device with its buttons clickable. It is built from the profile's button
+/// list — a column of macro keys, a volume roller, a thumb grid — so it fits any model that
+/// has those, and it glows with the current lighting effect. A keyboard's ordinary keys are
+/// clickable too: any of them can be given something else to do.
 struct DeviceSchematic: View {
     let kind: DeviceKind
     let keys: [DeviceKey]
     /// Buttons per row in a mouse's thumb grid.
     let gridColumns: Int
     let lighting: LightSpec?
+    /// What the keyboard's ordinary keys have been given to do, by usage.
+    var remapped: [UInt8: Assignment] = [:]
     let selected: Trigger?
     let pressed: Set<Trigger>
     let hovered: Trigger?
@@ -26,7 +29,8 @@ struct DeviceSchematic: View {
     /// Whether there is anything to draw for these buttons.
     static func canDraw(kind: DeviceKind, keys: [DeviceKey]) -> Bool {
         switch kind {
-        case .keyboard: return keys.contains { $0.group == "Macro keys" || $0.group == "Volume roller" }
+        // Every keyboard has ordinary keys to click on.
+        case .keyboard: return true
         case .mouse: return keys.contains { $0.group == "Thumb grid" }
         }
     }
@@ -59,25 +63,61 @@ struct DeviceSchematic: View {
 
     private func keyboard(scale: CGFloat, time: Double) -> some View {
         let layout = KeyboardLayout(macroKeys: macroKeys.count, hasRoller: !rollerKeys.isEmpty)
+        let gap = 0.07 * scale
+        func rect(_ unit: CGRect) -> CGRect {
+            CGRect(x: unit.minX * scale, y: unit.minY * scale, width: unit.width * scale, height: unit.height * scale).insetBy(dx: gap, dy: gap)
+        }
+        /// The ordinary key drawn at a point.
+        func key(at point: CGPoint) -> Trigger? {
+            let unit = CGPoint(x: point.x / scale, y: point.y / scale)
+            return layout.caps.first { $0.usage != nil && $0.rect.contains(unit) }?.trigger
+        }
         return ZStack(alignment: .topLeading) {
             Canvas { context, _ in
-                let gap = 0.07 * scale
-                func rect(_ unit: CGRect) -> CGRect {
-                    CGRect(x: unit.minX * scale, y: unit.minY * scale, width: unit.width * scale, height: unit.height * scale).insetBy(dx: gap, dy: gap)
-                }
                 // Underglow first, blurred, then the key caps on top of it.
                 context.drawLayer { layer in
                     layer.addFilter(.blur(radius: scale * 0.16))
-                    for key in layout.keys {
-                        let color = led(Double(key.midX / KeyboardLayout.size.width) * 0.8, time)
-                        layer.fill(Path(roundedRect: rect(key).insetBy(dx: -gap, dy: -gap), cornerRadius: scale * 0.2), with: .color(color.opacity(0.75)))
+                    for cap in layout.caps {
+                        let color = led(Double(cap.rect.midX / KeyboardLayout.size.width) * 0.8, time)
+                        layer.fill(Path(roundedRect: rect(cap.rect).insetBy(dx: -gap, dy: -gap), cornerRadius: scale * 0.2), with: .color(color.opacity(0.75)))
                     }
                 }
-                for key in layout.keys {
-                    context.fill(Path(roundedRect: rect(key), cornerRadius: scale * 0.17), with: .color(Color(rgb: 0x20242D)))
-                    context.stroke(Path(roundedRect: rect(key), cornerRadius: scale * 0.17), with: .color(Color.white.opacity(0.07)), lineWidth: 0.5)
+                for cap in layout.caps {
+                    let assignment = cap.usage.flatMap { remapped[$0] }
+                    let isSelected = cap.trigger != nil && cap.trigger == selected
+                    let isHovered = cap.trigger != nil && cap.trigger == hovered
+                    let isPressed = cap.trigger.map(pressed.contains) ?? false
+                    var fill = Color(rgb: 0x20242D)
+                    if isPressed { fill = Theme.accent } else if isSelected { fill = Theme.accent.opacity(0.6) } else if isHovered { fill = Color(rgb: 0x3D4354) } else if assignment != nil { fill = Color(rgb: 0x2E2B52) }
+                    var stroke = Color.white.opacity(0.07), width: CGFloat = 0.5
+                    if isSelected || isHovered { stroke = .white; width = isSelected ? 1.5 : 1 } else if assignment != nil { stroke = Theme.accent; width = 1 }
+                    let frame = rect(cap.rect)
+                    let path = Path(roundedRect: frame, cornerRadius: scale * 0.17)
+                    context.fill(path, with: .color(fill))
+                    context.stroke(path, with: .color(stroke), lineWidth: width)
+
+                    // A key that has become another key says which; otherwise what is printed on it.
+                    let legend = Self.legend(cap.legend, assignment)
+                    let size = min(frame.height * 0.44, frame.width / (CGFloat(max(legend.count, 1)) * 0.62 + 0.4), 13)
+                    let lit = assignment != nil || isSelected || isPressed
+                    context.draw(
+                        Text(legend).font(.system(size: size, weight: .semibold, design: .rounded)).foregroundColor(Color.white.opacity(lit ? 1 : (cap.usage == nil ? 0.3 : 0.6))),
+                        at: CGPoint(x: frame.midX, y: frame.midY))
                 }
             }
+            // One hit area for all the ordinary keys: a hundred views would be a lot to keep
+            // redrawing while the lighting animates.
+            Color.clear
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    var under: Trigger?
+                    if case .active(let point) = phase { under = key(at: point) }
+                    // Off the keys, only an ordinary key's highlight is ours to clear.
+                    if under != hovered, under != nil || hovered?.isOrdinaryKey == true { onHover(under) }
+                }
+                .gesture(SpatialTapGesture().onEnded { tap in
+                    if let trigger = key(at: tap.location) { onSelect(trigger) }
+                })
             ForEach(Array(macroKeys.enumerated()), id: \.element.id) { index, key in
                 if let unit = layout.macros[safe: index] {
                     button(key, unit: unit, scale: scale, led: led(0, time))
@@ -89,7 +129,35 @@ struct DeviceSchematic: View {
                 let unit = CGRect(x: layout.roller.minX + half * CGFloat(index), y: layout.roller.minY, width: half, height: layout.roller.height)
                 button(key, unit: unit, scale: scale, led: led(0.75, time))
             }
+            if let cap = layout.caps.first(where: { $0.trigger != nil && $0.trigger == hovered }), let usage = cap.usage {
+                callout(KeyboardKeys.byUsage[usage]?.title ?? cap.legend, remapped[usage]?.summary ?? "click to change", over: rect(cap.rect), width: KeyboardLayout.size.width * scale)
+            }
         }
+    }
+
+    private static func legend(_ printed: String, _ assignment: Assignment?) -> String {
+        guard let assignment else { return printed }
+        if assignment.steps.isEmpty { return "⊘" }
+        if assignment.steps.count == 1, case .tap(let chord) = assignment.steps[0] {
+            let keys = chord.display.trimmingCharacters(in: .whitespaces)
+            if keys.count <= 3 { return keys }
+        }
+        return printed
+    }
+
+    /// A small label naming the hovered key and what it does, above it (or below, at the top edge).
+    private func callout(_ title: String, _ detail: String, over frame: CGRect, width: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.system(size: 11, weight: .bold, design: .rounded))
+            Text(detail).font(.system(size: 11)).foregroundStyle(Theme.secondary).lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color.black.opacity(0.88)))
+        .overlay(Capsule().strokeBorder(Theme.strokeStrong))
+        .fixedSize()
+        .position(x: min(max(frame.midX, 70), width - 70), y: frame.minY > 30 ? frame.minY - 15 : frame.maxY + 15)
+        .allowsHitTesting(false)
     }
 
     // MARK: Mouse
@@ -217,38 +285,61 @@ private struct KeyboardLayout {
     /// Macro column, main block, navigation cluster, number pad; six rows with a gap under the top one.
     static let size = CGSize(width: 24.6, height: 6.5)
 
-    /// The ordinary keys, drawn but not clickable.
-    let keys: [CGRect]
+    struct Cap {
+        let rect: CGRect
+        /// nil for a key that is drawn but can't be assigned: Fn belongs to the keyboard itself.
+        let usage: UInt8?
+        let legend: String
+
+        var trigger: Trigger? { usage.map { Trigger(kind: .keyboard, source: .key($0)) } }
+    }
+
+    let caps: [Cap]
     let macros: [CGRect]
     let roller: CGRect
 
     init(macroKeys: Int, hasRoller: Bool) {
         func rowY(_ row: Int) -> CGFloat { row == 0 ? 0 : 0.5 + CGFloat(row) }
-        /// Keys of the given widths side by side, starting at `x`.
-        func run(_ widths: [CGFloat], x: CGFloat, row: Int) -> [CGRect] {
+        var caps: [Cap] = []
+        /// Keys side by side, starting at `x`: each a name from `KeyboardKeys`, with "*1.5" for
+        /// one that is wider than a unit. A name that is no key is drawn with that as its legend.
+        func run(_ keys: [String], x: CGFloat, row: Int, height: CGFloat = 1) {
             var x = x
-            return widths.map { width in
-                defer { x += width }
-                return CGRect(x: x, y: rowY(row), width: width, height: 1)
+            for spec in keys {
+                let parts = spec.components(separatedBy: "*")
+                let width = parts.count > 1 ? CGFloat(Double(parts[1]) ?? 1) : 1
+                let key = KeyboardKeys.byName[parts[0]]
+                caps.append(Cap(rect: CGRect(x: x, y: rowY(row), width: width, height: height), usage: key?.usage, legend: key?.legend ?? parts[0]))
+                x += width
             }
         }
         let main: CGFloat = 1.6, nav = main + 15.5, pad = nav + 3.5
-        var keys: [CGRect] = []
         // Function row: Esc, then three groups of four.
-        keys += run([1], x: main, row: 0) + run([1, 1, 1, 1], x: main + 2, row: 0) + run([1, 1, 1, 1], x: main + 6.5, row: 0) + run([1, 1, 1, 1], x: main + 11, row: 0)
-        keys += run(Array(repeating: 1, count: 13) + [2], x: main, row: 1)
-        keys += run([1.5] + Array(repeating: 1, count: 12) + [1.5], x: main, row: 2)
-        keys += run([1.75] + Array(repeating: 1, count: 11) + [2.25], x: main, row: 3)
-        keys += run([2.25] + Array(repeating: 1, count: 10) + [2.75], x: main, row: 4)
-        keys += run([1.25, 1.25, 1.25, 6.25, 1.25, 1.25, 1.25, 1.25], x: main, row: 5)
+        run(["escape"], x: main, row: 0)
+        run(["f1", "f2", "f3", "f4"], x: main + 2, row: 0)
+        run(["f5", "f6", "f7", "f8"], x: main + 6.5, row: 0)
+        run(["f9", "f10", "f11", "f12"], x: main + 11, row: 0)
+        run(["grave", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equal", "delete*2"], x: main, row: 1)
+        run(["tab*1.5", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "leftbracket", "rightbracket", "backslash*1.5"], x: main, row: 2)
+        run(["capslock*1.75", "a", "s", "d", "f", "g", "h", "j", "k", "l", "semicolon", "quote", "return*2.25"], x: main, row: 3)
+        run(["left-shift*2.25", "z", "x", "c", "v", "b", "n", "m", "comma", "period", "slash", "right-shift*2.75"], x: main, row: 4)
+        run(["left-ctrl*1.25", "left-cmd*1.25", "left-alt*1.25", "space*6.25", "right-alt*1.25", "Fn*1.25", "menu*1.25", "right-ctrl*1.25"], x: main, row: 5)
         // Navigation cluster and arrows.
-        for row in [0, 1, 2, 5] { keys += run([1, 1, 1], x: nav, row: row) }
-        keys += run([1], x: nav + 1, row: 4)
+        run(["printscreen", "scrolllock", "pause"], x: nav, row: 0)
+        run(["insert", "home", "pageup"], x: nav, row: 1)
+        run(["forwarddelete", "end", "pagedown"], x: nav, row: 2)
+        run(["up"], x: nav + 1, row: 4)
+        run(["left", "down", "right"], x: nav, row: 5)
         // Number pad; the roller, if there is one, takes the place of the keys above it.
-        if !hasRoller { keys += run([1, 1, 1, 1], x: pad, row: 0) }
-        for row in 1...4 { keys += run([1, 1, 1, 1], x: pad, row: row) }
-        keys += run([2, 1, 1], x: pad, row: 5)
-        self.keys = keys
+        if !hasRoller { run(["", "", "", ""], x: pad, row: 0) }
+        run(["numlock", "kp-divide", "kp-multiply", "kp-minus"], x: pad, row: 1)
+        run(["kp7", "kp8", "kp9"], x: pad, row: 2)
+        run(["kp-plus"], x: pad + 3, row: 2, height: 2)
+        run(["kp4", "kp5", "kp6"], x: pad, row: 3)
+        run(["kp1", "kp2", "kp3"], x: pad, row: 4)
+        run(["kp-enter"], x: pad + 3, row: 4, height: 2)
+        run(["kp0*2", "kp-dot"], x: pad, row: 5)
+        self.caps = caps
 
         // Six macro keys run down the whole left edge; fewer sit beside the main rows.
         let firstRow = macroKeys >= 6 ? 0 : 1

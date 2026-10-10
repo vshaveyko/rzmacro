@@ -128,6 +128,7 @@ struct MacrosPage: View {
                         ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
                             StepRow(
                                 index: index, count: steps.count, step: step, macroNames: names.filter { $0 != name },
+                                profileNames: model.config.profiles.map(\.name),
                                 onChange: { replace(index, in: name, with: $0) },
                                 onMove: { move(index, by: $0, in: name) },
                                 onDuplicate: { model.config.macros[name]?.steps.insert(step, at: index + 1) },
@@ -261,7 +262,7 @@ struct MacrosPage: View {
                     .buttonStyle(PillButtonStyle(compact: true))
             }
             Menu {
-                ForEach([StepKind.media, .app, .open, .macro, .light, .shell, .up], id: \.self) { kind in
+                ForEach([StepKind.media, .app, .open, .macro, .profile, .light, .shell, .up], id: \.self) { kind in
                     Button { append(kind.makeStep(macros: others), to: name) } label: { Label(kind.title, systemImage: kind.icon) }
                 }
             } label: {
@@ -383,6 +384,7 @@ private struct StepRow: View {
     let count: Int
     let step: Step
     let macroNames: [String]
+    let profileNames: [String]
     let onChange: (Step) -> Void
     let onMove: (Int) -> Void
     let onDuplicate: () -> Void
@@ -431,7 +433,7 @@ private struct StepRow: View {
                 .frame(width: 78, alignment: .leading)
                 .help("Change what kind of step this is")
 
-                StepValueEditor(step: step, macroNames: macroNames, onChange: onChange)
+                StepValueEditor(step: step, macroNames: macroNames, profileNames: profileNames, onChange: onChange)
                 if kind == .down {
                     Text("kept down until you let go of the button")
                         .font(.system(size: 11.5))

@@ -4,6 +4,9 @@ import UniformTypeIdentifiers
 
 /// A physical button as the device pages present it.
 struct DeviceKey: Identifiable {
+    /// Heading the keyboard's reassigned ordinary keys are listed under.
+    static let ordinaryGroup = "Remapped keys"
+
     let trigger: Trigger
     let label: String
     /// Full name, where the group and label don't make one.
@@ -38,11 +41,17 @@ struct DeviceKey: Identifiable {
         hotspot = key.hotspot
     }
 
-    /// A button the profile doesn't list: one that was seen being pressed, or is in the config.
+    /// A button the profile doesn't list: one that was seen being pressed, or is in the config —
+    /// or one of a keyboard's ordinary keys.
     init(unlisted trigger: Trigger) {
         self.trigger = trigger
-        group = "Other buttons"
+        group = trigger.isOrdinaryKey ? Self.ordinaryGroup : "Other buttons"
         switch trigger.source {
+        case .key(let usage) where trigger.isOrdinaryKey:
+            let key = KeyboardKeys.byUsage[usage]
+            label = key?.label ?? String(format: "%02X", usage)
+            name = key.map { $0.title.count == 1 ? "The \($0.title) key" : $0.title } ?? String(format: "Key %02X", usage)
+            defaultBehaviour = "Its usual job"
         case .raw(let code):
             label = String(format: "#%02X", code)
             defaultBehaviour = "Does nothing"
@@ -76,6 +85,7 @@ struct DevicePage: View {
                 VStack(alignment: .leading, spacing: 20) {
                     header
                     if model.config.driverMode[kind] != true { driverModeWarning }
+                    if let stuck = device?.stuckKeys, !stuck.isEmpty { stuckKeysWarning(stuck) }
                     deviceMap
                     Text(footnote)
                         .font(.system(size: 11.5))
@@ -89,8 +99,8 @@ struct DevicePage: View {
             Rectangle().fill(Theme.stroke).frame(width: 1).padding(.top, -Theme.titleBarOverlap)
             Group {
                 if let key = selectedKey {
-                    AssignmentInspector(model: model, key: key, profile: model.appProfile)
-                        .id(key.trigger.description + (model.appProfile ?? ""))
+                    AssignmentInspector(model: model, key: key, profile: model.editing)
+                        .id(key.trigger.description + (model.editing ?? ""))
                 } else {
                     VStack(spacing: 8) {
                         Image(systemName: "hand.tap").font(.system(size: 26)).foregroundStyle(Theme.tertiary)
@@ -102,6 +112,7 @@ struct DevicePage: View {
             .frame(width: 356)
             .background(Theme.sidebar.padding(.top, -Theme.titleBarOverlap))
         }
+        .onDisappear { model.cancelKeyPick() }
     }
 
     // MARK: Header
@@ -122,15 +133,36 @@ struct DevicePage: View {
                 }
             }
             Spacer()
-            profileMenu
+            VStack(alignment: .trailing, spacing: 6) {
+                profileMenu
+                profileNote
+            }
+        }
+    }
+
+    /// Whether what is being edited is what the buttons are doing right now.
+    @ViewBuilder private var profileNote: some View {
+        if !model.config.profiles.isEmpty {
+            if model.editing == model.activeProfile {
+                StatusChip(text: "In use now", color: Theme.good, dot: true)
+            } else {
+                StatusChip(text: "In use now: \(model.activeProfile ?? Profile.defaultName)", color: Theme.tertiary, dot: true)
+                    .help("The buttons are doing what the \(model.activeProfile ?? Profile.defaultName) profile says (\(model.profileReason)). What you change here applies when \(model.editing ?? Profile.defaultName) is in use.")
+            }
         }
     }
 
     private var footnote: String {
+        var tips: [String] = []
         if deviceProfile.productID == nil {
-            return "RZMacro has no layout for this model. Press its special buttons and they are listed here, ready to be assigned."
+            tips.append("RZMacro has no layout for this model. Press its special buttons and they are listed here, ready to be assigned.")
+        } else {
+            tips.append("Tip: press a button on the device to jump straight to it. Buttons light up here while they are held.")
         }
-        return "Tip: press a button on the device to jump straight to it. Buttons light up here while they are held."
+        if kind == .keyboard {
+            tips.append("Any ordinary key can be changed too — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it.")
+        }
+        return tips.joined(separator: " ")
     }
 
     private var driverModeWarning: some View {
@@ -148,12 +180,32 @@ struct DevicePage: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.warning.opacity(0.35)))
     }
 
+    /// The device reports keys down that nothing is holding (see `KeySlots`).
+    private func stuckKeysWarning(_ names: [String]) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.warning)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("The \(kind == .keyboard ? "keyboard" : "mouse") says \(names.formatted(.list(type: .and))) \(names.count == 1 ? "is" : "are") held down, with no button holding \(names.count == 1 ? "it" : "them").")
+                    .font(.system(size: 12.5, weight: .medium))
+                Text("Its buttons may not respond until that is cleared. Unplug it and plug it back in — its own plug, not a hub's, so that it loses power.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.warning.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.warning.opacity(0.35)))
+    }
+
     // MARK: Picture and buttons
 
+    /// What a button does in the profile being edited, and whether that comes from a profile
+    /// this one is based on rather than from itself.
     private func effective(_ key: DeviceKey) -> (assignment: Assignment?, inherited: Bool) {
-        if let own = model.assignment(for: key.trigger, profile: model.appProfile) { return (own, false) }
-        guard model.appProfile != nil, let base = model.assignment(for: key.trigger, profile: nil) else { return (nil, false) }
-        return (base, true)
+        guard let found = model.effective(key.trigger, profile: model.editing) else { return (nil, false) }
+        return (found.assignment, found.from != model.editing)
     }
 
     private func tile(_ key: DeviceKey) -> some View {
@@ -182,6 +234,29 @@ struct DevicePage: View {
                     }
                 }
             }
+            if kind == .keyboard { keyPicker(isFirst: !groups.contains(DeviceKey.ordinaryGroup)) }
+        }
+    }
+
+    /// Selects an ordinary key by pressing it — the way to one the drawing doesn't have, or
+    /// while the photo is showing.
+    private func keyPicker(isFirst: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if isFirst { SectionLabel(DeviceKey.ordinaryGroup) }
+            HStack(spacing: 10) {
+                if model.isPickingKey {
+                    RecordingDot()
+                    Text("Press the key on the keyboard…").font(.system(size: 12.5, weight: .medium))
+                    Button("Cancel") { model.cancelKeyPick() }.buttonStyle(PillButtonStyle(compact: true))
+                } else {
+                    Button { model.pickKey() } label: { Label("Pick a Key", systemImage: "keyboard") }
+                        .buttonStyle(PillButtonStyle(compact: true))
+                        .disabled(device == nil)
+                    Text(isFirst ? "No keys changed yet. Click one in the drawing, or pick it by pressing it." : "…or click one in the drawing.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.tertiary)
+                }
+            }
         }
     }
 
@@ -201,16 +276,27 @@ struct DevicePage: View {
         } else {
             DeviceSchematic(
                 kind: kind, keys: keys, gridColumns: deviceProfile.listColumns ?? 3, lighting: model.config.lighting,
+                remapped: remappedKeys,
                 selected: selected, pressed: model.pressed, hovered: model.hoveredButton,
                 summary: summary, isAssigned: isAssigned,
                 onHover: { model.hoveredButton = $0 },
                 onSelect: { model.selectedButton[kind] = $0 })
             .padding(kind == .keyboard ? 22 : 18)
+            // Room under a keyboard's keys for the switch in the corner: they are all clickable.
+            .padding(.bottom, kind == .keyboard && deviceProfile.picture != nil ? 26 : 0)
             .frame(maxWidth: .infinity)
             .background(RadialGradient(colors: [Color(rgb: 0x2C3140), Color(rgb: 0x171A21)], center: .center, startRadius: 0, endRadius: 360))
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.stroke))
             .overlay(alignment: .bottomTrailing) { pictureSwitch }
+        }
+    }
+
+    /// What the keyboard's ordinary keys do in the profile being edited, by usage.
+    private var remappedKeys: [UInt8: Assignment] {
+        guard kind == .keyboard else { return [:] }
+        return model.config.layer(for: model.editing).reduce(into: [:]) { result, binding in
+            if binding.key.isOrdinaryKey, case .key(let usage) = binding.key.source { result[usage] = binding.value }
         }
     }
 
@@ -275,71 +361,40 @@ struct DevicePage: View {
         }
     }
 
-    // MARK: App profiles
+    // MARK: Profiles
 
+    /// Chooses the profile whose assignments the page shows and changes.
     private var profileMenu: some View {
         Menu {
-            Button { model.appProfile = nil } label: { Label("All apps", systemImage: model.appProfile == nil ? "checkmark" : "square.grid.2x2") }
-            if !model.config.apps.isEmpty {
+            Button { model.editingProfile = nil } label: { Label(Profile.defaultName, systemImage: model.editing == nil ? "checkmark" : "square.grid.2x2") }
+            if !model.config.profiles.isEmpty {
                 Divider()
-                ForEach(model.config.apps.keys.sorted(), id: \.self) { bundleID in
-                    Button { model.appProfile = bundleID } label: {
-                        Label(AppModel.appName(bundleID), systemImage: model.appProfile == bundleID ? "checkmark" : "app")
+                ForEach(model.config.profiles, id: \.name) { profile in
+                    Button { model.editingProfile = profile.name } label: {
+                        Label(profile.name, systemImage: model.editing == profile.name ? "checkmark" : "square.stack.3d.up")
                     }
                 }
             }
             Divider()
-            Menu("New profile for…") {
-                ForEach(runningApps, id: \.self) { bundleID in
-                    Button(AppModel.appName(bundleID)) { addProfile(bundleID) }
-                }
-                Divider()
-                Button("Choose an app…") { chooseApp() }
-            }
-            if let profile = model.appProfile {
-                Button("Delete the \(AppModel.appName(profile)) profile", role: .destructive) {
-                    model.config.apps[profile] = nil
-                    model.appProfile = nil
-                }
-            }
+            Button("New Profile") { model.addProfile() }
+            Button("Manage Profiles…") { model.page = .profiles }
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: model.appProfile == nil ? "square.grid.2x2.fill" : "app.fill").font(.system(size: 11))
-                Text(model.appProfile.map(AppModel.appName) ?? "All apps").font(.system(size: 12.5, weight: .medium))
+                Image(systemName: model.editing == nil ? "square.grid.2x2.fill" : "square.stack.3d.up.fill").font(.system(size: 11))
+                Text(model.editing ?? Profile.defaultName).font(.system(size: 12.5, weight: .medium))
                 Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.tertiary)
             }
             .foregroundStyle(Theme.text)
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
-            .background(Capsule().fill(model.appProfile == nil ? Color.white.opacity(0.08) : Theme.accent.opacity(0.3)))
+            .background(Capsule().fill(model.editing == nil ? Color.white.opacity(0.08) : Theme.accent.opacity(0.3)))
             .contentShape(Capsule())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("Buttons can do different things per app. A profile only overrides the buttons you change in it.")
-    }
-
-    private var runningApps: [String] {
-        let ids = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }
-            .compactMap(\.bundleIdentifier)
-            .filter { $0 != Bundle.main.bundleIdentifier && model.config.apps[$0] == nil }
-        return Array(Set(ids)).sorted { AppModel.appName($0).localizedCaseInsensitiveCompare(AppModel.appName($1)) == .orderedAscending }
-    }
-
-    private func addProfile(_ bundleID: String) {
-        if model.config.apps[bundleID] == nil { model.config.apps[bundleID] = [:] }
-        model.appProfile = bundleID
-    }
-
-    private func chooseApp() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.application]
-        panel.directoryURL = URL(fileURLWithPath: "/Applications")
-        guard panel.runModal() == .OK, let url = panel.url, let bundleID = Bundle(url: url)?.bundleIdentifier else { return }
-        addProfile(bundleID)
+        .help("The profile being edited. A profile changes only the buttons you change in it; the rest do what the profile it is based on says. When each profile is used is set on the Profiles page.")
     }
 }
 

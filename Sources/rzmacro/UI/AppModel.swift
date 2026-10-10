@@ -3,7 +3,7 @@ import ServiceManagement
 import SwiftUI
 
 enum Page: String, CaseIterable, Identifiable {
-    case keyboard, mouse, macros, lighting, settings
+    case keyboard, mouse, profiles, macros, lighting, settings
 
     var id: String { rawValue }
 
@@ -11,6 +11,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .keyboard: return "Keyboard"
         case .mouse: return "Mouse"
+        case .profiles: return "Profiles"
         case .macros: return "Macros"
         case .lighting: return "Lighting"
         case .settings: return "Settings"
@@ -21,6 +22,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .keyboard: return "keyboard"
         case .mouse: return "computermouse"
+        case .profiles: return "square.stack.3d.up"
         case .macros: return "record.circle"
         case .lighting: return "lightbulb"
         case .settings: return "gearshape"
@@ -35,7 +37,7 @@ final class AppModel: ObservableObject {
 
     @Published var config: Config {
         didSet {
-            guard config != oldValue, !isSyncing, !isPreviewing else { return }
+            guard config != oldValue, !isSyncing, !isPreviewing, savesChanges else { return }
             // Lights follow a slider as it moves; everything else waits for the edit to settle.
             if config.lighting != oldValue.lighting { daemon.previewLighting(config.lighting) }
             scheduleSave()
@@ -46,8 +48,20 @@ final class AppModel: ObservableObject {
     @Published var selectedButton: [DeviceKind: Trigger] = [:]
     /// The button under the pointer, in the picture or in the list, so each can light the other.
     @Published var hoveredButton: Trigger?
-    /// Bundle identifier of the app profile being edited; nil is "all apps".
-    @Published var appProfile: String?
+    /// The profile being edited, on the device pages and the Profiles page; nil is the
+    /// default bindings. Use `editing`, which knows about profiles that have been deleted.
+    @Published var editingProfile: String?
+    /// The profile in force right now (nil: the default bindings), and why.
+    @Published var activeProfile: String?
+    @Published var profileReason = ""
+    /// The profile was chosen by hand over what an app, game or hero asks for.
+    @Published var isOverruled = false
+    @Published var dota = DotaWatcher.Status()
+    /// Whether Dota 2 is started with the launch option hero detection needs; nil if unknown.
+    @Published var dotaLaunchOption: Bool?
+    @Published var dotaError: String?
+    /// Waiting for a key to be pressed on the keyboard, to select it.
+    @Published var isPickingKey = false
     /// The macro open on the Macros page.
     @Published var selectedMacro: String?
     /// Buttons physically held right now, for highlighting.
@@ -67,6 +81,10 @@ final class AppModel: ObservableObject {
     @Published var isDownloadingPhoto = false
     @Published var photoError: String?
 
+    /// Off for a window that is only there to be looked at (`rzmacro render`): nothing done in
+    /// it reaches the driver or the config file.
+    var savesChanges = true
+    private var isCapturingKeys = false
     private var isSyncing = false
     /// Showing a configuration that is not the driver's (see `preview`).
     private var isPreviewing = false
@@ -77,8 +95,21 @@ final class AppModel: ObservableObject {
         config = daemon.config
         daemon.onStateChanged = { [weak self] in self?.sync() }
         daemon.onButton = { [weak self] trigger, down in self?.button(trigger, down) }
+        // While keys are being recorded in the window — and the window is where the typing
+        // goes — the keyboard's keys must be themselves (see `Daemon.isRecordingKeys`).
+        KeyCapture.onActivity = { [weak self] capturing in
+            self?.isCapturingKeys = capturing
+            self?.updateRecording()
+        }
+        for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateRecording() }
+        }
         sync()
         startsAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    private func updateRecording() {
+        daemon.isRecordingKeys = isCapturingKeys && NSApplication.shared.isActive
     }
 
     /// Pulls the driver's state into the window.
@@ -92,6 +123,10 @@ final class AppModel: ObservableObject {
         inputMonitoring = daemon.inputMonitoring
         accessibility = daemon.accessibility
         configError = daemon.configError
+        activeProfile = daemon.activeProfile
+        profileReason = daemon.profileReason.text
+        isOverruled = daemon.isOverruled
+        dota = daemon.dotaStatus
     }
 
     private func scheduleSave() {
@@ -119,6 +154,8 @@ final class AppModel: ObservableObject {
 
     private func button(_ trigger: Trigger, _ down: Bool) {
         if down { pressed.insert(trigger) } else { pressed.remove(trigger) }
+        // An ordinary key lights up while held, no more: it is typed on all the time.
+        if trigger.isOrdinaryKey { return }
         // Clicks and the wheel are in constant use: they shouldn't change what is selected.
         // Fn is the keyboard's own layer key.
         if case .button = trigger.source { return }
@@ -171,35 +208,167 @@ final class AppModel: ObservableObject {
         device(kind).map { DeviceProfile.profile(productID: $0.productID, kind: kind) } ?? DeviceProfile.preferred(for: kind)
     }
 
-    /// Every assignable button of a kind: the model's own, then any others that are bound or
-    /// have been seen pressed.
+    /// Every button of a kind worth listing: the model's special ones, any others that are
+    /// bound or have been seen pressed, and — of a keyboard's ordinary keys — the ones the
+    /// profile being edited gives something to do, plus the one selected, so that it can be.
     func keys(for kind: DeviceKind) -> [DeviceKey] {
         let listed = profile(for: kind).keys.map { DeviceKey($0, kind: kind) }
         let known = Set(listed.map(\.trigger))
-        let bound = Array(config.bindings.keys) + config.apps.values.flatMap(\.keys)
         var seen = Set<Trigger>()
-        let unlisted = (bound + seenButtons)
-            .filter { $0.kind == kind && !known.contains($0) && seen.insert($0).inserted }
+        let special = (config.allBindings.flatMap(\.keys) + seenButtons)
+            .filter { $0.kind == kind && !$0.isOrdinaryKey && !known.contains($0) && seen.insert($0).inserted }
             .sorted { $0.description < $1.description }
-            .map(DeviceKey.init(unlisted:))
-        return listed + unlisted
+        let ordinary = (Array(config.layer(for: editing).keys) + (selectedButton[kind].map { [$0] } ?? []))
+            .filter { $0.kind == kind && $0.isOrdinaryKey && seen.insert($0).inserted }
+            .sorted { $0.description < $1.description }
+        return listed + (special + ordinary).map(DeviceKey.init(unlisted:))
+    }
+
+    /// Selects the next ordinary key pressed on the keyboard, instead of that key doing anything.
+    func pickKey() {
+        isPickingKey = true
+        daemon.onKeyPick = { [weak self] trigger in
+            self?.isPickingKey = false
+            self?.selectedButton[.keyboard] = trigger
+        }
+    }
+
+    func cancelKeyPick() {
+        daemon.onKeyPick = nil
+        isPickingKey = false
     }
 
     func device(_ kind: DeviceKind) -> Daemon.DeviceSummary? { devices.first { $0.kind == kind } }
 
     // MARK: Assignments
 
-    /// `profile` is a bundle identifier, or nil for the bindings that apply everywhere.
+    /// What a profile itself assigns to a button; `profile` nil is the default bindings.
     func assignment(for trigger: Trigger, profile: String?) -> Assignment? {
-        if let profile { return config.apps[profile]?[trigger] }
-        return config.bindings[trigger]
+        config.bindings(of: profile)[trigger]
+    }
+
+    /// What a button does under a profile, counting what the profile is based on, and which
+    /// profile says so.
+    func effective(_ trigger: Trigger, profile: String?) -> (assignment: Assignment, from: String?)? {
+        config.assignment(for: trigger, in: profile)
     }
 
     func setAssignment(_ assignment: Assignment?, for trigger: Trigger, profile: String?) {
-        if let profile {
-            config.apps[profile, default: [:]][trigger] = assignment
-        } else {
-            config.bindings[trigger] = assignment
+        guard let profile else { return config.bindings[trigger] = assignment }
+        updateProfile(profile) { $0.bindings[trigger] = assignment }
+    }
+
+    // MARK: Profiles
+
+    /// The profile being edited, if it still exists; nil is the default bindings.
+    var editing: String? { editingProfile.flatMap { config.profile(named: $0)?.name } }
+
+    func updateProfile(_ name: String, _ change: (inout Profile) -> Void) {
+        guard let index = config.profiles.firstIndex(where: { $0.name == name }) else { return }
+        change(&config.profiles[index])
+    }
+
+    /// Adds a profile and makes it the one being edited. A taken name gets a number.
+    @discardableResult
+    func addProfile(named wanted: String? = nil, apps: [String] = [], heroes: [String] = []) -> String {
+        let base = wanted ?? "Profile"
+        var name = wanted ?? "Profile 1"
+        var suffix = 2
+        while config.profile(named: name) != nil || Profile.reservedNames.contains(name.lowercased()) {
+            name = "\(base) \(suffix)"
+            suffix += 1
+        }
+        var profile = Profile(name: name, apps: apps, heroes: heroes)
+        // A hero's profile builds on the game's, where there is one.
+        if !heroes.isEmpty, let game = config.profiles.first(where: { $0.apps.contains(DotaWatcher.bundleID) }) {
+            profile.basedOn = game.name
+        }
+        config.profiles.append(profile)
+        editingProfile = name
+        return name
+    }
+
+    /// Renames a profile and everything that refers to it. Returns false if the name can't be used.
+    func renameProfile(_ old: String, to new: String) -> Bool {
+        let new = new.trimmingCharacters(in: .whitespaces)
+        guard !new.isEmpty, new != old, !Profile.reservedNames.contains(new.lowercased()),
+              config.profile(named: new).map({ $0.name == old }) ?? true,
+              let index = config.profiles.firstIndex(where: { $0.name == old }) else { return false }
+        func renamed(_ steps: [Step]) -> [Step] { steps.map { $0 == .profile(old) ? .profile(new) : $0 } }
+        func renamed(_ bindings: [Trigger: Assignment]) -> [Trigger: Assignment] {
+            bindings.mapValues { var copy = $0; copy.steps = renamed($0.steps); return copy }
+        }
+        var updated = config
+        updated.profiles[index].name = new
+        updated.bindings = renamed(updated.bindings)
+        updated.macros = updated.macros.mapValues { var copy = $0; copy.steps = renamed($0.steps); return copy }
+        updated.profiles = updated.profiles.map { profile in
+            var copy = profile
+            copy.bindings = renamed(profile.bindings)
+            if profile.basedOn == old { copy.basedOn = new }
+            return copy
+        }
+        config = updated
+        if editingProfile == old { editingProfile = new }
+        // The driver knows the profile in use by name: hand it the new configuration, then the new name.
+        flushSave()
+        daemon.profileRenamed(from: old, to: new)
+        return true
+    }
+
+    func deleteProfile(_ name: String) {
+        guard let profile = config.profile(named: name) else { return }
+        var updated = config
+        updated.profiles.removeAll { $0.name == profile.name }
+        // Profiles built on it are built on whatever it was built on.
+        updated.profiles = updated.profiles.map { var copy = $0; if $0.basedOn == profile.name { copy.basedOn = profile.basedOn }; return copy }
+        config = updated
+        if editingProfile == profile.name { editingProfile = nil }
+    }
+
+    /// Earlier profiles win when several ask to be switched on.
+    func moveProfile(_ name: String, by offset: Int) {
+        guard let index = config.profiles.firstIndex(where: { $0.name == name }), config.profiles.indices.contains(index + offset) else { return }
+        config.profiles.swapAt(index, index + offset)
+    }
+
+    /// Switches to a profile by hand, now.
+    func useProfile(_ name: String?) {
+        flushSave()
+        daemon.switchProfile(name ?? "default")
+    }
+
+    /// Lets apps, games and heroes choose the profile again.
+    func resumeAutomaticProfile() {
+        daemon.switchProfile("auto")
+    }
+
+    /// One line on when a profile comes on by itself: "Dota 2 · Invoker, Meepo".
+    func rules(of profile: Profile) -> String {
+        var parts: [String] = []
+        if !profile.apps.isEmpty { parts.append(profile.apps.map(Self.appName).joined(separator: ", ") + (profile.whileRunning ? " running" : "")) }
+        if !profile.heroes.isEmpty { parts.append(profile.heroes.map(DotaHeroes.title).joined(separator: ", ")) }
+        return parts.isEmpty ? "Switched to by hand" : parts.joined(separator: " · ")
+    }
+
+    // MARK: Dota 2
+
+    func setUpDota() {
+        dotaError = daemon.setUpDota()
+        refreshDotaLaunchOption()
+    }
+
+    func removeDota() {
+        daemon.removeDota()
+        dotaError = nil
+    }
+
+    /// Steam's settings are a file to read, and the running game a process to ask: done when
+    /// the answer is about to be shown, not on every refresh.
+    func refreshDotaLaunchOption() {
+        DispatchQueue.global(qos: .utility).async {
+            let has = DotaWatcher.hasLaunchOption()
+            DispatchQueue.main.async { if self.dotaLaunchOption != has { self.dotaLaunchOption = has } }
         }
     }
 
@@ -227,7 +396,7 @@ final class AppModel: ObservableObject {
         updated.macros[new] = macro
         updated.macros = updated.macros.mapValues { var copy = $0; copy.steps = renamed($0.steps); return copy }
         updated.bindings = renamed(updated.bindings)
-        updated.apps = updated.apps.mapValues(renamed)
+        updated.profiles = updated.profiles.map { var copy = $0; copy.bindings = renamed($0.bindings); return copy }
         config = updated
         if selectedMacro == old { selectedMacro = new }
         return true
@@ -238,25 +407,22 @@ final class AppModel: ObservableObject {
         if selectedMacro == name { selectedMacro = config.macros.keys.sorted().first }
     }
 
-    /// The buttons a macro is assigned to, as short labels: "M3", "Thumb 7 · Safari".
+    /// The buttons a macro is assigned to, as short labels: "M3", "Thumb 7 · Dota".
     func usage(ofMacro name: String) -> [String] {
         func label(_ trigger: Trigger) -> String {
             let key = keys(for: trigger.kind).first { $0.trigger == trigger }
             return key.map { $0.group == "Thumb grid" ? "Thumb \($0.label)" : ($0.group == "Volume roller" ? "Roller \($0.label)" : $0.label) } ?? trigger.displayName
         }
         var places = config.bindings.filter { $0.value.steps.contains(.macro(name)) }.map { label($0.key) }
-        for (bundleID, bindings) in config.apps {
-            places += bindings.filter { $0.value.steps.contains(.macro(name)) }.map { "\(label($0.key)) · \(Self.appName(bundleID))" }
+        for profile in config.profiles {
+            places += profile.bindings.filter { $0.value.steps.contains(.macro(name)) }.map { "\(label($0.key)) · \(profile.name)" }
         }
         return places.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
     // MARK: Apps
 
-    static func appName(_ bundleID: String) -> String {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return bundleID }
-        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
-    }
+    static func appName(_ bundleID: String) -> String { appDisplayName(bundleID) }
 
     // MARK: Login item
 

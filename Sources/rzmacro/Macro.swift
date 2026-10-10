@@ -69,6 +69,9 @@ enum Step: Equatable {
     case light(String)
     /// Runs a macro from the library by name.
     case macro(String)
+    /// Switches to a profile by name; "next" and "previous" step through them, "default" is
+    /// the bindings outside any profile, "auto" hands the choice back to the rules.
+    case profile(String)
 }
 
 /// A named sequence in the macro library.
@@ -89,12 +92,35 @@ struct Assignment: Equatable {
     var repeatMs: Int?
 }
 
+private let pauseTimers = DispatchQueue(label: "rzmacro.pause", qos: .userInteractive)
+
+/// Waits this many microseconds — and no longer. `usleep` is not good enough here: macOS
+/// stretches the timers of apps in the background, and of everything but the game while one is
+/// full screen. Behind Dota a 1.5 ms `usleep` was measured at 45 ms and a 30 ms one at 125,
+/// which turned a quick double press into two slow ones. A strict timer is exempt from that
+/// (30.1 ms, same conditions).
+func pause(_ microseconds: UInt32) {
+    guard microseconds > 0 else { return }
+    let done = DispatchSemaphore(value: 0)
+    let timer = DispatchSource.makeTimerSource(flags: .strict, queue: pauseTimers)
+    timer.schedule(deadline: .now() + .microseconds(Int(microseconds)), leeway: .nanoseconds(0))
+    timer.setEventHandler { done.signal() }
+    timer.resume()
+    done.wait()
+    timer.cancel()
+}
+
 final class MacroEngine {
     /// Stamped on every event we post so our own event tap lets it through.
     static let injectedTag: Int64 = 0x525A_4D43
 
     /// Lighting belongs to the daemon; called on the main queue.
     var onLight: ((LightCommand) -> Void)?
+    /// So do profiles.
+    var onProfile: ((String) -> Void)?
+    /// Every key and click as it is sent, with the moment it went out — for `rzmacro sniff`,
+    /// which is how a macro that "does nothing" gets looked into. Called on a macro's own queue.
+    var onSend: ((Date, String) -> Void)?
 
     private let source: CGEventSource? = {
         let source = CGEventSource(stateID: .hidSystemState)
@@ -164,7 +190,7 @@ final class MacroEngine {
             queue.async {
                 repeat {
                     self.run(assignment.steps, button: id)
-                    usleep(UInt32(max(interval, 1)) * 1000)
+                    pause(UInt32(max(interval, 1)) * 1000)
                 } while self.isHeld(id)
             }
         } else {
@@ -225,26 +251,26 @@ final class MacroEngine {
             switch step {
             case .tap(let c):
                 chord(c, down: true)
-                if delay > 0 { usleep(delay) }
+                if delay > 0 { pause(delay) }
                 chord(c, down: false)
-                if delay > 0 { usleep(delay) }
+                if delay > 0 { pause(delay) }
             case .down(let c):
                 if let button, !isHeld(button) {
                     // The button is already up (a quick tap): nothing to hold for, so this is
                     // an ordinary press.
                     chord(c, down: true)
-                    if delay > 0 { usleep(delay) }
+                    if delay > 0 { pause(delay) }
                     chord(c, down: false)
                 } else {
                     chord(c, down: true)
                     if let button { keep(c, downFor: button) }
                 }
-                if delay > 0 { usleep(delay) }
+                if delay > 0 { pause(delay) }
             case .up(let c):
                 chord(c, down: false)
                 if let button { forget(c, downFor: button) }
             case .text(let text): type(text, gap: delay)
-            case .delay(let ms): usleep(UInt32(max(ms, 0)) * 1000)
+            case .delay(let ms): pause(UInt32(max(ms, 0)) * 1000)
             case .shell(let command): spawn("/bin/zsh", ["-lc", command])
             case .app(let name): spawn("/usr/bin/open", ["-a", name])
             case .open(let target): spawn("/usr/bin/open", [target])
@@ -257,6 +283,8 @@ final class MacroEngine {
                 // A macro may call another; the depth limit stops one that calls itself.
                 // Its own key speed applies if it has one, otherwise the caller's.
                 if depth < 8, let macro = macro(named: name) { run(macro.steps, keyDelay: macro.keyDelay ?? keyDelay, button: button, depth: depth + 1) }
+            case .profile(let name):
+                DispatchQueue.main.async { self.onProfile?(name) }
             }
         }
     }
@@ -264,10 +292,14 @@ final class MacroEngine {
     // MARK: Event posting
 
     private func post(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
+            onSend?(Date(), "COULD NOT MAKE the event for \(Keys.nameByCode[code] ?? "key \(code)")")
+            return
+        }
         event.flags = flags
         event.post(tap: .cghidEventTap)
-        usleep(1_500)
+        onSend?(Date(), "\(Keys.nameByCode[code] ?? Keys.modifiers.first { $0.code == code }?.name ?? "key \(code)") \(down ? "down" : "up")")
+        pause(1_500)
     }
 
     /// Presses modifiers in order, then the key; releases in reverse.
@@ -302,7 +334,7 @@ final class MacroEngine {
                 event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
                 event.post(tap: .cghidEventTap)
             }
-            usleep(max(gap, 2_500))
+            pause(max(gap, 2_500))
         }
     }
 
@@ -333,7 +365,8 @@ final class MacroEngine {
                 guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: position, mouseButton: button) else { continue }
                 event.setIntegerValueField(.mouseEventClickState, value: Int64(n))
                 event.post(tap: .cghidEventTap)
-                usleep(8_000)
+                onSend?(Date(), "mouse button \(type == downType ? "down" : "up")")
+                pause(8_000)
             }
         }
     }

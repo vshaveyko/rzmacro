@@ -5,9 +5,14 @@ import Foundation
 struct Config: Equatable {
     /// Whether to switch each device kind into Razer driver mode while the driver runs.
     var driverMode: [DeviceKind: Bool] = [.keyboard: true, .mouse: true]
+    /// What buttons do when no profile says otherwise: the "Default" profile.
     var bindings: [Trigger: Assignment] = [:]
-    /// Per-application overrides, keyed by bundle identifier.
-    var apps: [String: [Trigger: Assignment]] = [:]
+    /// Named sets of assignments. Where several ask to be switched on at once, the earlier wins.
+    var profiles: [Profile] = []
+    /// Whether apps, games and Dota heroes may switch profiles by themselves.
+    var autoSwitch = true
+    /// When to show the profile's name on screen for a moment as it changes.
+    var profileNotes = ProfileNotes.notApps
     /// The macro library: named step lists that assignments refer to with `{ macro: "name" }`.
     var macros: [String: Macro] = [:]
     /// How macros and shortcuts press keys, in milliseconds: each key is held this long and
@@ -41,6 +46,8 @@ struct Config: Equatable {
         guard let object = root as? [String: Any] else { throw ConfigError("top level must be an object { … }") }
 
         var config = Config()
+        /// `apps: { bundle id: bindings }`, from before profiles had names.
+        var perApp: [Profile] = []
         for (key, value) in object {
             switch key {
             case "devices":
@@ -57,11 +64,24 @@ struct Config: Equatable {
                 }
             case "bindings":
                 config.bindings = try parseBindings(value, path: "bindings")
+            case "profiles":
+                guard let profiles = value as? [Any] else { throw ConfigError("profiles: expected a list [ { name: …, bindings: { … } }, … ]") }
+                config.profiles = try profiles.enumerated().map { try parseProfile($1, path: "profiles[\($0)]") }
             case "apps":
                 guard let apps = value as? [String: Any] else { throw ConfigError("apps: expected an object keyed by bundle id") }
-                for (bundleID, bindings) in apps {
-                    config.apps[bundleID] = try parseBindings(bindings, path: "apps.\(bundleID)")
+                for (bundleID, bindings) in apps.sorted(by: { $0.key < $1.key }) {
+                    // Named after the app, as far as its identifier tells: "com.apple.Safari" is "Safari".
+                    let name = bundleID.split(separator: ".").last.map(String.init) ?? bundleID
+                    perApp.append(Profile(name: name, bindings: try parseBindings(bindings, path: "apps.\(bundleID)"), apps: [bundleID]))
                 }
+            case "autoSwitch":
+                guard let flag = value as? Bool else { throw ConfigError("autoSwitch: expected true or false") }
+                config.autoSwitch = flag
+            case "profileNotes":
+                guard let notes = (value as? String).flatMap(ProfileNotes.init(rawValue:)) else {
+                    throw ConfigError("profileNotes: expected one of \(ProfileNotes.allCases.map(\.rawValue).joined(separator: ", "))")
+                }
+                config.profileNotes = notes
             case "macros":
                 guard let macros = value as? [String: Any] else { throw ConfigError("macros: expected an object keyed by macro name") }
                 for (name, value) in macros {
@@ -81,10 +101,71 @@ struct Config: Equatable {
                 guard let options = value as? [String: Any] else { throw ConfigError("lighting: expected an object") }
                 do { config.lighting = try LightSpec(config: options) } catch { throw ConfigError("lighting: \(error)") }
             default:
-                throw ConfigError("unknown top-level key \"\(key)\" (expected devices, bindings, apps, macros, keyDelay, lighting)")
+                throw ConfigError("unknown top-level key \"\(key)\" (expected devices, bindings, profiles, macros, keyDelay, lighting, autoSwitch, profileNotes)")
+            }
+        }
+
+        for var profile in perApp {
+            let base = profile.name
+            var suffix = 2
+            while config.profile(named: profile.name) != nil || Profile.reservedNames.contains(profile.name.lowercased()) {
+                profile.name = "\(base) \(suffix)"
+                suffix += 1
+            }
+            config.profiles.append(profile)
+        }
+        for (index, profile) in config.profiles.enumerated() {
+            if config.profiles.prefix(index).contains(where: { $0.name.caseInsensitiveCompare(profile.name) == .orderedSame }) {
+                throw ConfigError("profiles[\(index)]: there is already a profile named \"\(profile.name)\"")
+            }
+            if let base = profile.basedOn, base != Profile.defaultName, config.profile(named: base) == nil {
+                throw ConfigError("profiles[\(index)].basedOn: there is no profile named \"\(base)\"")
             }
         }
         return config
+    }
+
+    private static func parseProfile(_ value: Any, path: String) throws -> Profile {
+        guard let object = value as? [String: Any] else { throw ConfigError("\(path): expected an object { name: …, bindings: { … } }") }
+        guard let name = (object["name"] as? String)?.trimmingCharacters(in: .whitespaces), !name.isEmpty else {
+            throw ConfigError("\(path).name: every profile needs a name")
+        }
+        guard !Profile.reservedNames.contains(name.lowercased()) else {
+            throw ConfigError("\(path).name: \"\(name)\" means something else — pick another name")
+        }
+        func strings(_ value: Any, _ option: String) throws -> [String] {
+            if let one = value as? String { return [one] }
+            guard let list = value as? [String] else { throw ConfigError("\(path).\(option): expected a list of names") }
+            return list
+        }
+        var profile = Profile(name: name)
+        for (option, value) in object {
+            switch option {
+            case "name":
+                break
+            case "bindings":
+                profile.bindings = try parseBindings(value, path: "\(path).bindings")
+            case "basedOn":
+                // A profile's name, "Default", or null for a profile that stands alone.
+                if value is NSNull {
+                    profile.basedOn = nil
+                } else if let base = value as? String {
+                    profile.basedOn = base.lowercased() == "default" ? Profile.defaultName : base
+                } else {
+                    throw ConfigError("\(path).basedOn: expected a profile's name, \"Default\" or null")
+                }
+            case "apps":
+                profile.apps = try strings(value, option)
+            case "whileRunning":
+                guard let flag = value as? Bool else { throw ConfigError("\(path).whileRunning: expected true or false") }
+                profile.whileRunning = flag
+            case "heroes":
+                profile.heroes = try strings(value, option).map(DotaHeroes.name(matching:))
+            default:
+                throw ConfigError("\(path): unknown option \"\(option)\" (expected name, bindings, basedOn, apps, whileRunning, heroes)")
+            }
+        }
+        return profile
     }
 
     private static func parseKeyDelay(_ value: Any, path: String) throws -> Int {
@@ -153,7 +234,7 @@ struct Config: Equatable {
             guard let object = value as? [String: Any] else { throw ConfigError("expected a key chord string or an action object") }
             let actions = object.filter { $0.key != "count" }
             guard actions.count == 1, let (name, argument) = actions.first else {
-                throw ConfigError("expected exactly one action (keys, text, shell, app, open, click, media, light, macro, delay, down, up), got: \(object.keys.sorted().joined(separator: ", "))")
+                throw ConfigError("expected exactly one action (keys, text, shell, app, open, click, media, light, macro, profile, delay, down, up), got: \(object.keys.sorted().joined(separator: ", "))")
             }
             func string() throws -> String {
                 guard let text = argument as? String else { throw ConfigError("\(name): expected a string") }
@@ -168,6 +249,7 @@ struct Config: Equatable {
             case "app": return .app(try string())
             case "open": return .open(try string())
             case "macro": return .macro(try string())
+            case "profile": return .profile(try string())
             case "delay":
                 guard let ms = argument as? Int, ms >= 0 else { throw ConfigError("delay: expected milliseconds") }
                 return .delay(ms)
@@ -201,7 +283,18 @@ struct Config: Equatable {
             "devices": Dictionary(uniqueKeysWithValues: DeviceKind.allCases.map { ($0.rawValue, ["driverMode": driverMode[$0] ?? false]) }),
             "bindings": bindingsObject(bindings),
         ]
-        if !apps.isEmpty { object["apps"] = apps.mapValues(bindingsObject) }
+        if !profiles.isEmpty {
+            object["profiles"] = profiles.map { profile -> [String: Any] in
+                var object: [String: Any] = ["name": profile.name, "bindings": bindingsObject(profile.bindings)]
+                if profile.basedOn != Profile.defaultName { object["basedOn"] = profile.basedOn ?? NSNull() }
+                if !profile.apps.isEmpty { object["apps"] = profile.apps }
+                if profile.whileRunning { object["whileRunning"] = true }
+                if !profile.heroes.isEmpty { object["heroes"] = profile.heroes }
+                return object
+            }
+        }
+        if !autoSwitch { object["autoSwitch"] = false }
+        if profileNotes != .notApps { object["profileNotes"] = profileNotes.rawValue }
         if !macros.isEmpty {
             object["macros"] = macros.mapValues { macro -> Any in
                 let steps = macro.steps.map(\.jsonValue)
@@ -238,6 +331,7 @@ extension Step {
         case .media(let key): return ["media": key.name]
         case .light(let words): return ["light": words]
         case .macro(let name): return ["macro": name]
+        case .profile(let name): return ["profile": name]
         }
     }
 }

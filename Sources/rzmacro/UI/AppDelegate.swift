@@ -2,12 +2,13 @@ import AppKit
 import SwiftUI
 
 /// The menu-bar item and the configuration window around the driver.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let daemon: Daemon
     private let model: AppModel
     private let showWindowAtLaunch: Bool
     private var statusItem: NSStatusItem?
     private var window: NSWindow?
+    private let profileNote = ProfileNote()
 
     init(daemon: Daemon, showWindowAtLaunch: Bool) {
         self.daemon = daemon
@@ -19,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildMainMenu()
         buildStatusItem()
         daemon.onShowWindow = { [weak self] in self?.showWindow() }
+        daemon.onProfileChanged = { [weak self] name, reason in self?.profileNote.show(name, reason) }
         daemon.onSnapshot = { [weak self] page, path, done in self?.snapshot(page: page, path: path, done: done) }
 
         // Opened by hand: show the window. Started at login: stay out of the way in the menu bar.
@@ -97,44 +99,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
-    /// Developer aid: renders one page of the window to a PNG, without needing screen-recording
-    /// permission. Options: `select=<button>` picks a button or `macro=<name>` a macro,
-    /// `photos=on|off` chooses photo or drawing, and `config=<file>` shows that configuration
-    /// instead of the real one (display only).
+    /// Developer aid: renders one page of the window to a PNG (see `PageRenderer`).
     private func snapshot(page: String, path: String, done: @escaping (String) -> Void) {
-        let parts = page.split(separator: ",").map(String.init)
-        guard let page = parts.first.flatMap(Page.init(rawValue:)) else { return done("unknown page (\(Page.allCases.map(\.rawValue).joined(separator: ", ")))") }
         if window == nil { window = makeWindow() }
-        var photosBefore: Bool?
-        for option in parts.dropFirst() {
-            let pair = option.split(separator: "=", maxSplits: 1).map(String.init)
-            guard pair.count == 2 else { continue }
-            switch pair[0] {
-            case "config": model.preview(try? Config.load(from: URL(fileURLWithPath: pair[1])))
-            case "select": if let trigger = try? Trigger(parsing: pair[1]) { model.selectedButton[trigger.kind] = trigger }
-            case "macro": model.selectedMacro = pair[1].replacingOccurrences(of: "_", with: " ")
-            case "profile": model.appProfile = pair[1]
-            case "photos": photosBefore = photosBefore ?? model.showsPhotos; model.showsPhotos = pair[1] == "on"
-            default: break
-            }
-        }
-        model.page = page
+        let photosBefore = model.showsPhotos, profileBefore = model.editingProfile
+        guard PageRenderer.apply(page, to: model) != nil else { return done("unknown page (\(Page.allCases.map(\.rawValue).joined(separator: ", ")))") }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
             defer {
                 self?.model.preview(nil)
-                self?.model.appProfile = nil
-                if let before = photosBefore { self?.model.showsPhotos = before }
+                self?.model.editingProfile = profileBefore
+                self?.model.showsPhotos = photosBefore
             }
-            guard let view = self?.window?.contentView else { return done("no view") }
-            // Always at 2x, whatever screen the window happens to be on.
-            let size = view.bounds.size
-            guard let bitmap = NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2), bitsPerSample: 8,
-                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
-            else { return done("no bitmap") }
-            bitmap.size = size
-            view.cacheDisplay(in: view.bounds, to: bitmap)
-            guard let data = bitmap.representation(using: .png, properties: [:]) else { return done("could not encode") }
+            guard let view = self?.window?.contentView, let data = PageRenderer.png(of: view) else { return done("could not draw the page") }
             do {
                 try data.write(to: URL(fileURLWithPath: path))
                 done("wrote \(path)")
@@ -150,14 +126,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "RZMacro")
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open RZMacro", action: #selector(openFromMenu), keyEquivalent: "").target = self
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit RZMacro", action: #selector(quitFromMenu), keyEquivalent: "").target = self
+        menu.delegate = self
         item.menu = menu
         statusItem = item
     }
 
+    /// The menu-bar menu, put together each time it opens: the profiles, and which of them is
+    /// in use, change behind its back.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === statusItem?.menu else { return }
+        menu.removeAllItems()
+        menu.addItem(withTitle: "Open RZMacro", action: #selector(openFromMenu), keyEquivalent: "").target = self
+        let profiles = daemon.config.profiles
+        if !profiles.isEmpty {
+            menu.addItem(.separator())
+            menu.addItem(.sectionHeader(title: "Profile"))
+            for name in [nil] + profiles.map({ Optional($0.name) }) {
+                let item = NSMenuItem(title: name ?? Profile.defaultName, action: #selector(useProfileFromMenu(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = name
+                item.state = daemon.activeProfile == name ? .on : .off
+                menu.addItem(item)
+            }
+            menu.addItem(.separator())
+            if daemon.isOverruled {
+                // Chosen by hand over what the app or game in front asks for.
+                let back = NSMenuItem(title: "Back to \(daemon.automaticProfile ?? Profile.defaultName) (Automatic)", action: #selector(resumeAutomaticFromMenu), keyEquivalent: "")
+                back.target = self
+                menu.addItem(back)
+            }
+            let automatic = NSMenuItem(title: "Switch Automatically", action: #selector(toggleAutomaticFromMenu), keyEquivalent: "")
+            automatic.target = self
+            automatic.state = daemon.config.autoSwitch ? .on : .off
+            menu.addItem(automatic)
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit RZMacro", action: #selector(quitFromMenu), keyEquivalent: "").target = self
+    }
+
     @objc private func openFromMenu() { showWindow() }
+
+    @objc private func useProfileFromMenu(_ sender: NSMenuItem) { model.useProfile(sender.representedObject as? String) }
+
+    @objc private func resumeAutomaticFromMenu() { model.resumeAutomaticProfile() }
+
+    @objc private func toggleAutomaticFromMenu() { model.config.autoSwitch.toggle() }
 
     /// Asked for by name from the menu bar: no "are you sure".
     @objc private func quitFromMenu() { daemon.shutdown() }
@@ -191,5 +204,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         main.addItem(withTitle: "Window", action: nil, keyEquivalent: "").submenu = windowMenu
 
         NSApp.mainMenu = main
+    }
+}
+
+/// A note at the top of the screen, gone after a moment: which profile just came on. It takes
+/// no clicks and no focus, and shows over a game in full screen.
+final class ProfileNote {
+    private var panel: NSPanel?
+    private var hiding: DispatchWorkItem?
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .screenSaver
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        return panel
+    }
+
+    func show(_ name: String, _ reason: String) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+        let view = NSHostingView(rootView: ProfileNoteView(name: name, reason: reason))
+        let size = view.fittingSize
+        panel.contentView = view
+        let area = screen.visibleFrame
+        panel.setFrame(NSRect(x: area.midX - size.width / 2, y: area.maxY - size.height - 64, width: size.width, height: size.height), display: true)
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+
+        hiding?.cancel()
+        let work = DispatchWorkItem {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.35
+                panel.animator().alphaValue = 0
+            }, completionHandler: {
+                // Shown again while fading: leave it up.
+                if panel.alphaValue == 0 { panel.orderOut(nil) }
+            })
+        }
+        hiding = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
+    }
+}
+
+private struct ProfileNoteView: View {
+    let name: String
+    let reason: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "square.stack.3d.up.fill")
+                .font(.system(size: 17))
+                .foregroundStyle(Theme.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.text)
+                Text("Profile · \(reason)").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color(rgb: 0x14161C).opacity(0.95)))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.16)))
+        .fixedSize()
     }
 }

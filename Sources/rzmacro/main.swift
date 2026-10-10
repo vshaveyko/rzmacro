@@ -16,9 +16,14 @@ func usage() -> Never {
                              set lighting on all devices in sync, until the config changes:
                              off | static <colour> | breathing <colour…> | spectrum | wave
       light brightness <N|+N|-N>
+      profile [<name>|default|next|previous|auto]
+                             list the profiles, or switch to one by hand ("auto" goes back
+                             to whatever the running app or game asks for)
+      dota [setup|remove]    Dota 2 hero detection: its state, switch it on, switch it off
       press <button> [ms]    run what a button is assigned to, as if it were held that long
-      sniff [seconds] [all]  print button events as you press them ("all" adds raw reports
-                             of ordinary typing, for bringing up a new device)
+      sniff [seconds] [all]  print button events as you press them, and every key the macros
+                             they run send ("all" adds raw reports of ordinary typing, for
+                             bringing up a new device)
       mode <keyboard|mouse|all> <normal|driver|auto>
                              temporarily force a device mode
       raw <keyboard|mouse> <class> <id> <size> [args…]
@@ -61,8 +66,12 @@ case "daemon":
 case nil where isatty(STDIN_FILENO) == 0:
     // Launched as an app (Finder, `open`, login item).
     runApp(showWindow: true)
-case "status", "reload", "quit", "sniff", "mode", "raw", "light", "show", "snapshot", "press":
+case "status", "reload", "quit", "sniff", "mode", "raw", "light", "show", "snapshot", "press", "profile", "dota":
     exit(Client.run(arguments))
+case "render":
+    // Developer aid: render <page>[,options] <path.png> — a page of the window as a picture, without the driver.
+    guard let page = arguments[safe: 1], let path = arguments[safe: 2] else { usage() }
+    PageRenderer.run(page, path: path)
 case "check":
     do {
         let file = arguments[safe: 1].map { URL(fileURLWithPath: $0) } ?? Paths.configFile
@@ -70,7 +79,7 @@ case "check":
         // What the app would write back must read as the same configuration.
         let written = try JSONSerialization.data(withJSONObject: config.jsonObject)
         guard try Config.parse(written) == config else { throw ConfigError("internal error: the configuration does not survive being saved") }
-        print("ok: \(config.bindings.count) bindings, \(config.apps.count) app profiles, \(config.macros.count) macros")
+        print("ok: \(config.bindings.count) bindings, \(config.profiles.count) profiles, \(config.macros.count) macros")
     } catch {
         print("error: \(error)")
         exit(1)
@@ -80,6 +89,8 @@ case "keys":
     print("keys:      " + Keys.table.map(\.0).joined(separator: " "))
     print("aliases:   " + (Keys.aliases.map { "\($0.key)=\($0.value)" } + Keys.modifierAliases.map { "\($0.key)=\($0.value)" }).sorted().joined(separator: " "))
     print("media:     " + MediaKey.allCases.map(\.name).joined(separator: " "))
+    print("keyboard keys that can be reassigned, as keyboard.<name>:")
+    print("           " + KeyboardKeys.all.map(\.name).joined(separator: " "))
 case "config":
     print(Paths.configFile.path)
 case "version", "--version":

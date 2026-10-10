@@ -5,7 +5,7 @@ import SwiftUI
 
 /// What a single step is, for menus, icons and labels.
 enum StepKind: String, CaseIterable, Identifiable {
-    case tap, down, text, delay, click, media, app, open, macro, light, shell, up
+    case tap, down, text, delay, click, media, app, open, macro, profile, light, shell, up
 
     var id: String { rawValue }
 
@@ -17,6 +17,7 @@ enum StepKind: String, CaseIterable, Identifiable {
         case .down: return "Hold"
         case .up: return "Release"
         case .macro: return "Run macro"
+        case .profile: return "Switch profile"
         case .app: return "Open app"
         case .open: return "Open"
         case .shell: return "Shell"
@@ -34,6 +35,7 @@ enum StepKind: String, CaseIterable, Identifiable {
         case .down: return "arrow.down.to.line"
         case .up: return "arrow.up.to.line"
         case .macro: return "bolt.fill"
+        case .profile: return "square.stack.3d.up.fill"
         case .app: return "macwindow"
         case .open: return "link"
         case .shell: return "terminal"
@@ -57,6 +59,7 @@ enum StepKind: String, CaseIterable, Identifiable {
         case .media: self = .media
         case .light: self = .light
         case .macro: self = .macro
+        case .profile: self = .profile
         }
     }
 
@@ -75,6 +78,7 @@ enum StepKind: String, CaseIterable, Identifiable {
         case .media: return .media(.play)
         case .light: return .light("static red")
         case .macro: return .macro(macros.first ?? "")
+        case .profile: return .profile("next")
         }
     }
 }
@@ -95,6 +99,13 @@ extension Step {
         case .media(let key): return key.title
         case .light(let words): return words.capitalized
         case .macro(let name): return name.isEmpty ? "Macro" : name
+        case .profile(let name):
+            switch name.lowercased() {
+            case "next": return "Next profile"
+            case "previous": return "Previous profile"
+            case "auto": return "Automatic profile"
+            default: return "Profile: \(name.lowercased() == "default" ? Profile.defaultName : name)"
+            }
         }
     }
 }
@@ -197,7 +208,16 @@ struct ChordView: View {
 /// Captures key presses made in the app's own window while it is active.
 final class KeyCapture: ObservableObject {
     @Published private(set) var isActive = false
-    private var monitor: Any?
+    private var monitor: Any? {
+        didSet { if (monitor == nil) != (oldValue == nil) { Self.running += monitor == nil ? -1 : 1 } }
+    }
+    /// How many captures are listening, anywhere in the window.
+    private static var running = 0 {
+        didSet { if (running > 0) != (oldValue > 0) { onActivity?(running > 0) } }
+    }
+    /// Told when capturing starts and stops. While it runs the keyboard's keys must be
+    /// themselves: what gets recorded is the key pressed, not what a profile makes of it.
+    static var onActivity: ((Bool) -> Void)?
     /// The most modifiers held at once since capture started, for modifier-only shortcuts.
     private var peak: [KeyModifier] = []
 
@@ -240,7 +260,10 @@ final class KeyCapture: ObservableObject {
     }
 
     deinit {
-        if let monitor { NSEvent.removeMonitor(monitor) }
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            Self.running -= 1
+        }
     }
 }
 

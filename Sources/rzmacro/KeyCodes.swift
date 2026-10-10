@@ -46,11 +46,12 @@ enum Keys {
 
     /// In the order macOS draws them.
     static let modifiers: [KeyModifier] = [
-        KeyModifier(name: "ctrl", flag: .maskControl, code: 59, symbol: "⌃"),
-        KeyModifier(name: "alt", flag: .maskAlternate, code: 58, symbol: "⌥"),
-        KeyModifier(name: "shift", flag: .maskShift, code: 56, symbol: "⇧"),
-        KeyModifier(name: "cmd", flag: .maskCommand, code: 55, symbol: "⌘"),
-        KeyModifier(name: "fn", flag: .maskSecondaryFn, code: 63, symbol: "fn "),
+        KeyModifier(name: "ctrl", flag: .maskControl, code: 59, usage: 0x7_0000_00e0, symbol: "⌃"),
+        KeyModifier(name: "alt", flag: .maskAlternate, code: 58, usage: 0x7_0000_00e2, symbol: "⌥"),
+        KeyModifier(name: "shift", flag: .maskShift, code: 56, usage: 0x7_0000_00e1, symbol: "⇧"),
+        KeyModifier(name: "cmd", flag: .maskCommand, code: 55, usage: 0x7_0000_00e3, symbol: "⌘"),
+        // Fn is not a keyboard-page key: it lives on Apple's own usage page.
+        KeyModifier(name: "fn", flag: .maskSecondaryFn, code: 63, usage: 0xff_0000_0003, symbol: "fn "),
     ]
 
     static let modifierAliases: [String: String] = [
@@ -68,6 +69,7 @@ enum Keys {
     static let nameByCode: [CGKeyCode: String] = Dictionary(table.map { ($0.1, $0.0) }, uniquingKeysWith: { a, _ in a })
     static let usageByCode: [CGKeyCode: UInt8] = Dictionary(table.map { ($0.1, $0.2) }, uniquingKeysWith: { a, _ in a })
     static let nameByUsage: [UInt8: String] = Dictionary(table.map { ($0.2, $0.0) }, uniquingKeysWith: { a, _ in a })
+    static let usageByName: [String: UInt8] = Dictionary(table.map { ($0.0, $0.2) }, uniquingKeysWith: { a, _ in a })
 
     /// Canonical key name for user input ("Enter" -> "return"), nil if unknown.
     static func canonicalName(_ name: String) -> String? {
@@ -88,6 +90,8 @@ struct KeyModifier: Equatable {
     let flag: CGEventFlags
     /// The left-hand key.
     let code: CGKeyCode
+    /// The same key as the keyboard driver names it: usage page and usage in one number.
+    let usage: UInt64
     let symbol: String
 }
 

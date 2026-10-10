@@ -1,6 +1,7 @@
 # RZMacro
 
-Macro keys, button remapping and synced RGB lighting for Razer keyboards and mice on macOS.
+Macro keys, button and key remapping, profiles that follow your game, and synced RGB lighting
+for Razer keyboards and mice on macOS.
 
 Razer's own Mac software doesn't support many of its devices, older ones in particular. On a
 Mac that leaves a keyboard's macro keys doing nothing, a mouse's extra buttons stuck with
@@ -24,7 +25,12 @@ window to configure them in.
 - **Macros.** Record them by typing, or build them step by step: key presses, held keys,
   text, pauses, clicks. Choose per macro whether keys go out instantly or with a delay (some
   games need one).
-- **Per-app profiles.** A button can do one thing in your editor and another in a game.
+- **Remap ordinary keys too.** Caps Lock into Escape, Alt and Win swapped, a key that runs a
+  macro. A plain key-for-key swap is done by the keyboard driver itself, so it works
+  everywhere, games and password fields included.
+- **Profiles.** Named sets of assignments, one built on another. Switch between them from the
+  menu bar or with a button — or let them switch themselves: while an app is in front, while
+  a game is running, or while you are playing a certain **Dota 2 hero**.
 - **Lighting in sync.** Off, static, breathing, spectrum or wave, rendered from one clock and
   streamed to every device, so keyboard and mouse never drift apart.
 - **Lives in the menu bar**, and everything is also in a plain config file and a small
@@ -79,16 +85,30 @@ macOS asks you to allow two things, in **System Settings → Privacy & Security*
 
 What it does with them: it opens only USB devices with Razer's vendor id, and looks at keyboard
 events only to decide whether one came from a bound mouse button (or is an Fn combination the
-keyboard has handed over). Nothing you type is stored or sent anywhere. The app makes no
-network connections, with one exception that happens only if you click it: the **Photo** button
-on a device page downloads that model's product picture from razer.com.
+keyboard has handed over). Of the Razer keyboard's own keys it acts on the ones you have given
+something to do and ignores the rest. Nothing you type is stored or sent anywhere.
+
+The app makes no network connections, with two exceptions that happen only if you ask: the
+**Photo** button on a device page downloads that model's product picture from razer.com, and
+setting up [Dota 2 hero detection](#dota-2-heroes) makes it listen on this Mac's own loopback
+address (`127.0.0.1`) for the game to report to. To know which profile applies it also looks
+at which app is in front and which are running — their identifiers, nothing else.
 
 ## Using it
 
 - **Keyboard / Mouse.** Click a button in the picture or in the list — or just press it on the
   device — and choose an action from the tiles on the right. *Shortcut* starts listening
   straight away. *Macro* lets you pick a saved macro or record a new one on the spot. The menu
-  in the top corner switches between "All apps" and per-app profiles.
+  in the top corner chooses which profile you are editing.
+- **Ordinary keys.** Every key in the keyboard drawing can be clicked and given an action
+  (*Pick a Key* selects one by pressing it). Give it a single key and leave *Hold down* on,
+  and it simply is that key — Caps Lock is Escape. Give it anything else and it works like a
+  macro key. Only the Razer keyboard is affected, not the Mac's own.
+- **Profiles.** Make profiles, say what each is based on, and say when it switches on by
+  itself: add apps or games (while in front, or for as long as they run) and Dota 2 heroes.
+  Higher in the list wins when several apply. To switch by hand use the menu-bar icon, or give
+  a button the *Profile* action — next, previous, or a particular one. A profile chosen by
+  hand while a game's profile is on lasts until you leave the game.
 - **Macros.** *Record* captures the keys you type (optionally with the pauses between them).
   Steps can be changed, reordered, duplicated and added by hand. A **Hold** step keeps a key
   down until you let go of the button, so "Press F4, Hold F4" is a double-tap-and-hold.
@@ -97,6 +117,26 @@ on a device page downloads that model's product picture from razer.com.
 - **Lighting.** Pick an effect, colours, speed and brightness. Fn+F11 / Fn+F12 on the keyboard
   dim and brighten everything together.
 - **Settings.** Permissions, connected devices, driver mode, key speed, start at login.
+
+## Dota 2 heroes
+
+A profile can switch on while you are playing a particular hero — one layout for Invoker,
+another for Meepo, on top of a general one for the game.
+
+RZMacro learns the hero from Dota itself, through Valve's Game State Integration: the
+interface stream overlays use, in which the game posts its state to addresses listed in
+settings files in its own folder. Nothing is read from the game's memory. To set it up:
+
+1. On the **Profiles** page add a hero to a profile and click **Set Up**. That writes one small
+   file, `gamestate_integration_rzmacro.cfg`, into Dota's `cfg/gamestate_integration` folder,
+   asking for the hero only and pointing at this Mac only. **Remove** deletes it again.
+2. In Steam, right-click Dota 2 → Properties → General → Launch Options and add
+   `-gamestateintegration`. The game ignores those files without it. The Profiles page says
+   whether it is set.
+3. Restart Dota 2.
+
+A hero's profile applies while Dota is the app in front. Base it on your Dota profile and it
+only has to contain what is different for that hero.
 
 ## Other devices
 
@@ -166,6 +206,7 @@ written by hand (JSON with comments; comments are lost when the app next saves):
   },
 
   bindings: {
+    "keyboard.capslock": { keys: "escape", hold: true },   // Caps Lock is Escape
     "keyboard.M1": "cmd+space",
     "keyboard.M2": { text: "hello there" },
     "keyboard.M3": { macro: "Copy to other app" },
@@ -175,20 +216,39 @@ written by hand (JSON with comments; comments are lost when the app next saves):
     "mouse.5": { keys: "shift", hold: true },          // the button is Shift while held
     "mouse.7": [],                                     // disabled
     "mouse.12": { app: "Terminal" },
+    "keyboard.M5": { profile: "next" },                // step through the profiles
   },
 
-  // Different bindings while an app is frontmost, by bundle identifier.
-  apps: {
-    "com.apple.Safari": { "mouse.1": "cmd+t", "mouse.2": "cmd+w" },
-  },
+  // Other sets of bindings. Each changes only what it mentions; the rest comes from what it
+  // is based on ("Default" — the bindings above — unless it says otherwise; null for nothing).
+  // Earlier profiles win when several want to switch on.
+  profiles: [
+    { name: "Browsing", apps: ["com.apple.Safari"],             // while Safari is in front
+      bindings: { "mouse.1": "cmd+t", "mouse.2": "cmd+w" } },
+    { name: "Dota", apps: ["com.valvesoftware.dota2"],
+      bindings: { "keyboard.left-cmd": [], "mouse.3": "f4" } }, // no Win key in the game
+    { name: "Invoker", basedOn: "Dota", heroes: ["invoker"],    // while playing Invoker
+      bindings: { "keyboard.capslock": { macro: "Copy to other app" } } },
+    { name: "Recording", apps: ["com.obsproject.obs-studio"], whileRunning: true,
+      bindings: { "keyboard.M1": "cmd+shift+r" } },             // even with OBS in the background
+  ],
 }
 ```
 
 Buttons are named `keyboard.M1`…, `keyboard.roller-up` / `roller-down`, `mouse.1`…`mouse.12`,
 `mouse.right-click`, `mouse.wheel-click`, `mouse.wheel-up` / `wheel-down`, `mouse.back` /
-`forward`, or by what `rzmacro sniff` shows (`keyboard.raw:2a`, `mouse.key:3d`). Actions are a shortcut string
-or one of `keys`, `text`, `shell`, `app`, `open`, `media`, `click`, `light`, `macro`, `delay`,
+`forward`, or by what `rzmacro sniff` shows (`keyboard.raw:2a`, `mouse.key:3d`). The keyboard's ordinary
+keys are `keyboard.<key>`: `keyboard.capslock`, `keyboard.a`, `keyboard.left-alt`, `keyboard.kp1`
+(`rzmacro keys` lists them). Actions are a shortcut string
+or one of `keys`, `text`, `shell`, `app`, `open`, `media`, `click`, `light`, `macro`, `profile`, `delay`,
 `down`, `up`; a list is a sequence. Options: `hold`, `repeat`, `on: "release"`.
+
+An ordinary key bound to one key with `hold: true` is swapped for it in the keyboard driver;
+with anything else it runs the action and stops typing its own character. Heroes are written
+the way the game or its players name them (`"invoker"`, `"Anti-Mage"`, `"npc_dota_hero_zuus"`).
+`autoSwitch: false` turns automatic switching off; `profileNotes: "always" | "except-apps" | "never"`
+says when a profile change is shown on screen. Older files' `apps: { "<bundle id>": { … } }`
+are still read, as one profile per app.
 
 ```
 rzmacro show                        open the window
@@ -196,6 +256,9 @@ rzmacro status                      devices, permissions, bindings, lighting
 rzmacro check                       validate the config file
 rzmacro light wave period=4         try an effect
 rzmacro press keyboard.M1 500       run a button's assignment as if held for 500 ms
+rzmacro profile                     the profiles, and which one is in use and why
+rzmacro profile next                switch by hand: a name, default, next, previous, auto
+rzmacro dota                        hero detection: what it hears from the game
 rzmacro sniff                       show button events as you press them
 rzmacro keys                        key names usable in shortcuts
 rzmacro quit                        stop (devices go back to normal mode)
@@ -216,6 +279,17 @@ The log is at `~/Library/Logs/rzmacro.log`.
   way to click. A reassigned wheel direction applies to any wheel mouse that is plugged in
   (a turn of the wheel can't be traced to one device); trackpad scrolling is never affected.
 - Bindings are per kind of device (`keyboard.…`, `mouse.…`), so two mice share theirs.
+- Key swaps live in the keyboard driver while RZMacro runs and are taken off when it quits. If
+  it is ever killed outright, they stay until it is started again or the keyboard is
+  replugged. Caps Lock can be remapped like any key; the Fn key can't, it never leaves the
+  keyboard.
+- While a shortcut or macro is being recorded in the window, the keyboard's keys are
+  themselves again, so what you press is what gets recorded.
+- A device's mode is not changed while one of its buttons is down. A Naga X whose side button
+  is held across the change goes on reporting that button's key as held — to macOS as well —
+  until the mouse loses power, and the button stops responding. RZMacro waits for the buttons
+  to come up first (two seconds at most). Should a mouse end up that way regardless, the Mouse
+  page and `rzmacro status` say so; unplugging the mouse itself, not a hub it shares, clears it.
 - Razer Synapse can stay installed alongside.
 
 ## Credits and licence

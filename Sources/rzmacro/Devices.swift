@@ -18,7 +18,7 @@ enum DeviceKind: String, CaseIterable {
 enum KeySource: Hashable, CustomStringConvertible {
     /// Vendor code on report ID 4 — how Razer devices report keys they don't handle themselves.
     case raw(UInt8)
-    /// Keyboard-page usage typed by a mouse button.
+    /// Keyboard-page usage: a key typed by a mouse button, or an ordinary key of a keyboard.
     case key(UInt8)
     /// Bit in the mouse button byte: 0 left, 1 right, 2 middle (the wheel), 3 back, 4 forward.
     case button(Int)
@@ -54,8 +54,11 @@ struct Trigger: Hashable, CustomStringConvertible {
 
     var description: String { "\(kind.rawValue).\(source)" }
 
-    /// Friendly name when there is one: "keyboard.M1".
+    /// Friendly name when there is one: "keyboard.M1", "keyboard.capslock".
     var displayName: String {
+        if kind == .keyboard, case .key(let usage) = source {
+            return KeyboardKeys.byUsage[usage].map { "keyboard.\($0.name)" } ?? description
+        }
         if let name = KeyNames.table(for: kind).first(where: { $0.1 == source })?.0 { return "\(kind.rawValue).\(name)" }
         return description
     }
@@ -65,7 +68,7 @@ struct Trigger: Hashable, CustomStringConvertible {
         self.source = source
     }
 
-    /// "keyboard.M1", "mouse.7", "mouse.raw:20"
+    /// "keyboard.M1", "keyboard.capslock", "mouse.7", "mouse.raw:20"
     init(parsing text: String) throws {
         guard let dot = text.firstIndex(of: "."), let kind = DeviceKind(configName: String(text[..<dot])) else {
             throw ConfigError("\"\(text)\": expected \"keyboard.<key>\" or \"mouse.<button>\"")
@@ -75,8 +78,10 @@ struct Trigger: Hashable, CustomStringConvertible {
             self.init(kind: kind, source: source)
         } else if let source = KeyNames.table(for: kind).first(where: { $0.0.lowercased() == name.lowercased() })?.1 {
             self.init(kind: kind, source: source)
+        } else if kind == .keyboard, let usage = KeyboardKeys.usage(named: name) {
+            self.init(kind: kind, source: .key(usage))
         } else {
-            let known = KeyNames.table(for: kind).map(\.0).joined(separator: ", ")
+            let known = KeyNames.table(for: kind).map(\.0).joined(separator: ", ") + (kind == .keyboard ? ", any key by name (capslock, a, left-cmd…)" : "")
             throw ConfigError("\"\(text)\": unknown \(kind.rawValue) key \"\(name)\" (known: \(known), or raw:XX / key:XX / btn:N / wheel:up|down)")
         }
     }
@@ -117,16 +122,22 @@ final class HIDInterface {
     var openResult: IOReturn = kIOReturnNotOpen
     /// Opened exclusively: macOS itself no longer receives this interface's reports.
     private(set) var isSeized = false
+    private var watchesKeys = false
     weak var owner: RazerDevice?
 
     /// Keyboard usages currently reported down on this interface.
     var keysDown = Set<UInt8>()
+    /// Keys a mouse keeps reporting down with no button holding them, and how many copies of
+    /// each (see `KeySlots`).
+    var stuckKeys: [UInt8: Int] = [:]
     var lastSniffed: [UInt8] = []
 
     private let buffer: UnsafeMutablePointer<UInt8>
     private let bufferSize: Int
     /// HID elements looked up so far, by usage page and usage.
     private var elements: [UInt32: IOHIDElement?] = [:]
+    /// Every key or button element of the interface, once they have been asked for.
+    private var inputs: [IOHIDElement]?
 
     var isKeyboard: Bool { usagePage == 1 && usage == 6 }
     var isMouse: Bool { usagePage == 1 && usage == 2 }
@@ -174,8 +185,19 @@ final class HIDInterface {
         IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
     }
 
+    /// Asks to be told about every key on this interface going down or up. The values come from
+    /// the system's own reading of the report descriptor, so it makes no difference whether
+    /// the keyboard reports six keys at a time or all of them.
+    func watchKeys(_ handler: @escaping IOHIDValueCallback) {
+        guard openResult == kIOReturnSuccess, isKeyboard, maxInput > 0 else { return }
+        IOHIDDeviceSetInputValueMatching(device, [kIOHIDElementUsagePageKey: kHIDPage_KeyboardOrKeypad] as CFDictionary)
+        IOHIDDeviceRegisterInputValueCallback(device, handler, Unmanaged.passUnretained(self).toOpaque())
+        watchesKeys = true
+    }
+
     func close() {
         guard openResult == kIOReturnSuccess else { return }
+        if watchesKeys { IOHIDDeviceRegisterInputValueCallback(device, nil, nil) }
         if maxInput > 0 {
             IOHIDDeviceRegisterInputReportCallback(device, buffer, bufferSize, nil, nil)
             IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
@@ -197,14 +219,35 @@ final class HIDInterface {
             elements[id] = .some((IOHIDDeviceCopyMatchingElements(device, match, 0) as? [IOHIDElement])?.first)
         }
         guard let element = elements[id] ?? nil else { return false }
+        return isDown(element)
+    }
+
+    private func isDown(_ element: IOHIDElement) -> Bool {
         let value = UnsafeMutablePointer<Unmanaged<IOHIDValue>>.allocate(capacity: 1)
         defer { value.deallocate() }
         guard IOHIDDeviceGetValue(device, element, value) == kIOReturnSuccess else { return false }
         return IOHIDValueGetIntegerValue(value.pointee.takeUnretainedValue()) != 0
     }
 
+    /// Every key (of a keyboard interface) or button (of a mouse one) that is down right now, by
+    /// the kernel's element cache — which also knows what went down before we were listening.
+    func usagesDownNow() -> Set<Int> {
+        guard openResult == kIOReturnSuccess, isKeyboard || isMouse else { return [] }
+        if inputs == nil {
+            let page = isKeyboard ? kHIDPage_KeyboardOrKeypad : kHIDPage_Button
+            let all = IOHIDDeviceCopyMatchingElements(device, [kIOHIDElementUsagePageKey: page] as CFDictionary, 0) as? [IOHIDElement] ?? []
+            // Usages 1 to 3 of a keyboard are its ways of saying "too many keys", not keys.
+            inputs = all.filter {
+                [kIOHIDElementTypeInput_Button, kIOHIDElementTypeInput_Misc].contains(IOHIDElementGetType($0))
+                    && ((isKeyboard ? 4 : 1)...0xe7).contains(Int(IOHIDElementGetUsage($0)))
+            }
+        }
+        return Set((inputs ?? []).filter(isDown).map { Int(IOHIDElementGetUsage($0)) })
+    }
+
     func isKeyDownNow(_ usage: UInt8) -> Bool {
-        keysDown.contains(usage) || (isKeyboard && isDownNow(page: kHIDPage_KeyboardOrKeypad, usage: Int(usage)))
+        // A stuck key is down as far as the kernel knows; only our own count can tell a press of it.
+        keysDown.contains(usage) || (isKeyboard && stuckKeys[usage] == nil && isDownNow(page: kHIDPage_KeyboardOrKeypad, usage: Int(usage)))
     }
 
     /// `bit` as in the button byte: 0 left, 1 right, 2 middle…
@@ -222,6 +265,8 @@ final class RazerDevice {
     var control: RazerControl?
     var firmware: String?
     var lastModeError: String?
+    /// Since when a change of device mode has been waiting for the buttons to come up.
+    var modeWaitSince: Date?
     weak var manager: DeviceManager?
 
     /// Vendor codes currently down (report ID 4).
@@ -245,6 +290,42 @@ final class RazerDevice {
     func isKeyDownNow(_ usage: UInt8) -> Bool { interfaces.contains { $0.isKeyDownNow(usage) } }
 
     func isButtonDownNow(_ bit: Int) -> Bool { buttons & (1 << bit) != 0 || interfaces.contains { $0.isButtonDownNow(bit) } }
+
+    /// Keys the device reports down that none of its buttons is holding (see `KeySlots`).
+    var stuckKeys: Set<UInt8> { interfaces.reduce(into: Set<UInt8>()) { $0.formUnion($1.stuckKeys.keys) } }
+
+    /// Whether a button is down whose meaning depends on the device mode: a keyboard's macro
+    /// keys, anything on a mouse. The device mode must not change under one (see `KeySlots`).
+    var hasButtonsDown: Bool {
+        if !rawDown.isEmpty { return true }
+        guard kind == .mouse else { return false }
+        return buttons != 0 || !keysDown.isEmpty || interfaces.contains { !$0.usagesDownNow().isEmpty }
+    }
+}
+
+/// The key slots of a mouse's keyboard report: the keys its buttons are typing.
+///
+/// A slot is not always a button being held. The firmware (a Naga X's, at least) puts a
+/// button's key into the report when the button goes down and takes one such key out when it
+/// comes up — whatever the button's key is at that moment, and that depends on the device
+/// mode: the sixth side button is "6" in driver mode and whatever the mouse's own memory says
+/// in normal mode. A button held across a change of mode therefore leaves the key it went down
+/// as in every report from then on, until the mouse loses power. macOS takes that key to be
+/// held, and so did we: the button was never seen to go down again.
+///
+/// What gives such a key away is the next press of its button, which shows the key twice. A
+/// button cannot be down twice, so all but one of the copies have nothing holding them.
+enum KeySlots {
+    /// The keys buttons are holding, going by the slots of one report. `stuck` — the copies
+    /// of each key known to be held by nothing — is brought up to date.
+    static func held(in slots: some Sequence<UInt8>, stuck: inout [UInt8: Int]) -> Set<UInt8> {
+        var counts: [UInt8: Int] = [:]
+        for usage in slots where usage > 3 { counts[usage, default: 0] += 1 }
+        for (usage, count) in counts where count - 1 > stuck[usage, default: 0] { stuck[usage] = count - 1 }
+        // One that has gone was a button held after all, or the mouse has been reset.
+        stuck = stuck.filter { counts[$0.key, default: 0] >= $0.value }
+        return Set(counts.filter { $0.value > stuck[$0.key, default: 0] }.keys)
+    }
 }
 
 final class DeviceManager {
@@ -256,6 +337,8 @@ final class DeviceManager {
 
     var onEvent: ((RazerDevice, KeySource, Bool) -> Void)?
     var onReport: ((RazerDevice, HIDInterface, [UInt8]) -> Void)?
+    /// A device turned out to report keys down that nothing is holding, or stopped doing so.
+    var onStuckKeys: ((RazerDevice) -> Void)?
     /// Called shortly after interfaces appear or disappear, once enumeration has settled.
     var onDevicesChanged: (() -> Void)?
 
@@ -297,6 +380,22 @@ final class DeviceManager {
             interface.owner?.manager?.handleReport(interface, Array(UnsafeBufferPointer(start: report, count: length)))
         }
         device.manager = self
+        // A mouse button that is already down is not a press: it is told from one by knowing
+        // about it before its first report arrives.
+        if device.kind == .mouse && interface.isKeyboard {
+            interface.keysDown = Set(interface.usagesDownNow().compactMap { UInt8(exactly: $0) })
+        }
+        // A keyboard's ordinary keys, for the ones that have been given something else to do.
+        // (A mouse's typed keys are read from its reports, below.)
+        if device.kind == .keyboard {
+            interface.watchKeys { context, _, _, value in
+                let interface = Unmanaged<HIDInterface>.fromOpaque(context!).takeUnretainedValue()
+                let element = IOHIDValueGetElement(value)
+                let usage = IOHIDElementGetUsage(element)
+                guard IOHIDElementGetUsagePage(element) == kHIDPage_KeyboardOrKeypad, (0x04...0xe7).contains(usage) else { return }
+                interface.owner?.manager?.keyChanged(interface, UInt8(usage), down: IOHIDValueGetIntegerValue(value) != 0)
+            }
+        }
         if interface.isControl && interface.openResult == kIOReturnSuccess {
             device.control = RazerControl(device: hidDevice)
         }
@@ -335,14 +434,14 @@ final class DeviceManager {
                 emit(device, from: device.rawDown, to: now) { .raw($0) }
                 device.rawDown = now
             case 1 where device.kind == .mouse:
-                // [id, modifiers, key array…]
-                updateKeys(device, interface, Set(bytes.dropFirst(2).filter { $0 > 3 }))
+                // [id, modifiers, key slots…]
+                updateKeys(device, interface, slots: bytes.dropFirst(2))
             default:
                 break
             }
         } else if interface.isKeyboard && device.kind == .mouse && bytes.count >= 8 {
-            // Boot keyboard: [modifiers, reserved, 6 keys]
-            updateKeys(device, interface, Set(bytes[2..<8].filter { $0 > 3 }))
+            // Boot keyboard: [modifiers, reserved, 6 key slots]
+            updateKeys(device, interface, slots: bytes[2..<8])
         } else if interface.isMouse && device.kind == .keyboard && bytes.count >= 4 {
             // [buttons, x, y, wheel, …]: one roller notch per unit. Reported as the same vendor
             // codes other Razer keyboards use for their volume controls.
@@ -361,6 +460,23 @@ final class DeviceManager {
                 onEvent?(device, .button(bit), now & (1 << bit) != 0)
             }
         }
+    }
+
+    /// One key of a keyboard went down or up. The same key can be reported on two interfaces;
+    /// it counts as down while either says so.
+    fileprivate func keyChanged(_ interface: HIDInterface, _ usage: UInt8, down: Bool) {
+        guard let device = interface.owner else { return }
+        var now = interface.keysDown
+        if down { now.insert(usage) } else { now.remove(usage) }
+        updateKeys(device, interface, now)
+    }
+
+    /// A mouse's report of the keys its buttons are typing.
+    private func updateKeys(_ device: RazerDevice, _ interface: HIDInterface, slots: some Sequence<UInt8>) {
+        let before = device.stuckKeys
+        let held = KeySlots.held(in: slots, stuck: &interface.stuckKeys)
+        updateKeys(device, interface, held)
+        if device.stuckKeys != before { onStuckKeys?(device) }
     }
 
     private func updateKeys(_ device: RazerDevice, _ interface: HIDInterface, _ now: Set<UInt8>) {

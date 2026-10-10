@@ -8,6 +8,8 @@ struct StepValueEditor: View {
     let step: Step
     /// Macros this step may run (the one being edited is left out by the caller).
     let macroNames: [String]
+    /// Profiles this step may switch to.
+    var profileNames: [String] = []
     var roomy = false
     /// Start listening for a shortcut as soon as the editor appears.
     var recordOnAppear = false
@@ -64,6 +66,19 @@ struct StepValueEditor: View {
             }
             .labelsHidden()
             .frame(maxWidth: 240)
+        case .profile(let name):
+            // Stepping through them, a particular one, or back to what the running game asks for.
+            let fixed = [("next", "Next profile"), ("previous", "Previous profile"), ("auto", "Back to automatic"), ("default", Profile.defaultName)]
+            let current = fixed.contains { $0.0 == name.lowercased() } ? name.lowercased() : name
+            Picker("", selection: Binding(get: { current }, set: { onChange(.profile($0)) })) {
+                ForEach(fixed.prefix(3), id: \.0) { Text($0.1).tag($0.0) }
+                Divider()
+                Text(Profile.defaultName).tag("default")
+                ForEach(profileNames, id: \.self) { Text($0).tag($0) }
+                if !profileNames.contains(current) && !fixed.contains(where: { $0.0 == current }) { Text("\(name) (missing)").tag(current) }
+            }
+            .labelsHidden()
+            .fixedSize()
         }
     }
 

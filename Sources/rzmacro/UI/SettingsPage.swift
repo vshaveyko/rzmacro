@@ -47,6 +47,15 @@ struct SettingsPage: View {
                     KeySpeedControl(value: model.config.keyDelay) { model.config.keyDelay = $0 ?? 0 }
                 }
 
+                group("Profiles") {
+                    settingRow(
+                        "Show the profile's name on screen when it changes",
+                        "A note at the top of the screen for a moment, over a game too — so you can tell which profile you just switched to, or that your hero's is on. With profiles for apps, “Always” also shows it every time you switch to one of those apps."
+                    ) { EmptyView() }
+                    Segmented(options: [(ProfileNotes.always, "Always"), (ProfileNotes.notApps, "By hand and for heroes"), (ProfileNotes.never, "Never")], selection: $model.config.profileNotes)
+                        .frame(maxWidth: 420)
+                }
+
                 group("Startup") {
                     settingRow(
                         "Start RZMacro when I log in",

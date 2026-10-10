@@ -15,6 +15,8 @@ final class Daemon {
     private let server = ControlServer()
     private let tap = EventTap()
     private let lighting = LightingController()
+    private let remapper = KeyRemapper()
+    private let dota = DotaWatcher()
 
     private(set) var config = Config()
     private(set) var configError: String?
@@ -24,6 +26,16 @@ final class Daemon {
     var onButton: ((Trigger, Bool) -> Void)?
     /// `rzmacro show` / a second launch of the app.
     var onShowWindow: (() -> Void)?
+    /// The profile in force changed: its name and why, for a note on screen.
+    var onProfileChanged: ((_ name: String, _ reason: String) -> Void)?
+    /// While set, the next ordinary key pressed on the keyboard goes here instead of doing
+    /// anything (the window's "pick a key by pressing it").
+    var onKeyPick: ((Trigger) -> Void)?
+    /// The window is recording key presses. Until it stops the keyboard's keys are themselves
+    /// again, so that what is recorded is the key pressed, not what a profile makes of it.
+    var isRecordingKeys = false {
+        didSet { if isRecordingKeys != oldValue { applyKeyRemap() } }
+    }
     /// Developer aid: render a page of the window to a PNG, then report how it went.
     var onSnapshot: ((_ page: String, _ path: String, _ done: @escaping (String) -> Void) -> Void)?
     private var configModified: Date?
@@ -33,8 +45,44 @@ final class Daemon {
     private let started = Date()
 
     /// Assignment chosen when a button went down, so its release goes to the same one even if
-    /// the frontmost app changed in between.
+    /// the profile changed in between.
     private var active: [Trigger: Assignment] = [:]
+    /// Ordinary keys the window has been told are down.
+    private var shownDown = Set<Trigger>()
+
+    /// Why a profile is the one in force.
+    enum ProfileReason: Equatable {
+        case chosen
+        case appInFront(String), appRunning(String), hero(String)
+
+        var text: String {
+            switch self {
+            case .chosen: return "chosen by hand"
+            case .appInFront(let bundleID): return "\(appDisplayName(bundleID)) is in front"
+            case .appRunning(let bundleID): return "\(appDisplayName(bundleID)) is running"
+            case .hero(let name): return "playing \(DotaHeroes.title(name))"
+            }
+        }
+    }
+
+    /// The profile in force; nil is the default bindings.
+    private(set) var activeProfile: String?
+    private(set) var profileReason = ProfileReason.chosen
+    /// What the rules ask for right now, whether or not they are being overruled by hand.
+    private(set) var automaticProfile: String?
+    /// A profile was chosen by hand while a rule was in force. That lasts until the rules ask
+    /// for something else — leaving the game, another hero.
+    private(set) var isOverruled = false
+    private var overrulingProfile: String?
+    /// The profile chosen by hand, in force whenever no rule applies. It is where things were
+    /// left, not a setting, so it is kept out of the config file.
+    private var chosenProfile: String? {
+        get { UserDefaults.standard.string(forKey: "profile") }
+        set { UserDefaults.standard.set(newValue, forKey: "profile") }
+    }
+    /// Every assignment in force under the active profile.
+    private var layer: [Trigger: Assignment] = [:]
+    private var lastDotaStatus = DotaWatcher.Status()
     /// Key-downs we swallowed; the matching key-up must go too.
     private var swallowed = Set<CGKeyCode>()
     /// The same for mouse buttons, by button number.
@@ -78,17 +126,44 @@ final class Daemon {
         devices.onEvent = { [unowned self] device, source, pressed in self.handle(device, source, pressed) }
         devices.onReport = { [unowned self] device, interface, bytes in self.sniff(device, interface, bytes) }
         devices.onDevicesChanged = { [unowned self] in self.devicesChanged() }
+        devices.onStuckKeys = { [unowned self] device in
+            log("\(device.name): \(Self.stuckText(device) ?? "no longer reports keys held by nothing")")
+            self.onStateChanged?()
+        }
         devices.start()
 
         engine.onLight = { [unowned self] command in _ = self.applyLight(command) }
+        engine.onProfile = { [unowned self] name in _ = self.switchProfile(name) }
+        engine.onSend = { [unowned self] moment, what in
+            DispatchQueue.main.async { if !self.sniffers.isEmpty { self.broadcast("sent    \(what)", at: moment) } }
+        }
+
+        dota.onChange = { [unowned self] in self.refreshProfile() }
+        dota.start()
+        // What is in front, and what is running, decide the profile.
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [unowned self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                if app?.bundleIdentifier == DotaWatcher.bundleID {
+                    // The game may have been installed, or its library drive plugged in, since we started.
+                    if name == NSWorkspace.didLaunchApplicationNotification { self.dota.start() }
+                    if name == NSWorkspace.didTerminateApplicationNotification { self.dota.gameQuit() }
+                }
+                self.refreshProfile()
+            }
+        }
         tap.handler = { [unowned self] type, event in self.shouldSwallow(type, event) }
-        updateTap()
+        // Again, now that the permissions and the game's state are known.
+        refreshProfile()
 
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [unowned self] _ in self.tick() }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [unowned self] _ in
             // USB devices come back in normal mode after sleep.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 self.applyModes()
+                self.remapper.devicesChanged()
+                self.applyKeyRemap()
                 self.lighting.invalidate()
             }
         }
@@ -111,7 +186,13 @@ final class Daemon {
 
     /// Hands the devices back to their firmware before going away.
     func releaseDevices() {
+        // Not with a button down (see applyModes). Buttons are heard coming up by the run loop.
+        let deadline = Date().addingTimeInterval(Self.modeWait)
+        while Date() < deadline, devices.devices.contains(where: { $0.control != nil && $0.hasButtonsDown }) {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
         tap.stop()
+        remapper.clear(products: keyboardProducts)
         for device in devices.devices {
             guard let control = device.control, (try? control.deviceMode()) == DeviceMode.driver.rawValue else { continue }
             try? control.setDeviceMode(.normal)
@@ -121,6 +202,7 @@ final class Daemon {
     /// Everything that has to happen before the process goes away, however it goes away.
     func prepareForExit() {
         releaseDevices()
+        dota.stop()
         server.stop()
         log("stopped")
     }
@@ -160,12 +242,25 @@ final class Daemon {
         if trusted != accessibility {
             accessibility = trusted
             log("Accessibility permission \(trusted ? "granted" : "revoked")")
+            applyKeyRemap()
             updateTap()
             onStateChanged?()
         }
         let modified = (try? FileManager.default.attributesOfItem(atPath: Paths.configFile.path))?[.modificationDate] as? Date
         if modified != configModified { reloadConfig() }
-        if ticks % 15 == 0 { applyModes() }
+        if ticks % 15 == 0 {
+            applyModes()
+            // A keyboard that reconnected behind our back has lost its key mapping; this only
+            // touches one that has.
+            remapper.devicesChanged()
+            applyKeyRemap()
+        }
+        if dota.hero != nil && !DotaWatcher.isRunning { dota.gameQuit() }
+        let dotaStatus = dota.status
+        if dotaStatus != lastDotaStatus {
+            lastDotaStatus = dotaStatus
+            onStateChanged?()
+        }
         lighting.refresh()
         sniffers.removeAll { $0.isClosed }
         verboseSniffers.removeAll { $0.isClosed }
@@ -177,7 +272,7 @@ final class Daemon {
         do {
             config = try Config.load(from: Paths.configFile)
             configError = nil
-            log("config loaded: \(config.bindings.count) bindings, \(config.apps.count) app profiles")
+            log("config loaded: \(config.bindings.count) bindings, \(config.profiles.count) profiles")
         } catch {
             configError = "\(error)"
             log("config error: \(error) — keeping the previous configuration")
@@ -194,8 +289,7 @@ final class Daemon {
             lighting.update(spec: config.lighting)
         }
         if previous.driverMode != config.driverMode { applyModes() }
-        updateTap()
-        onStateChanged?()
+        refreshProfile()
     }
 
     /// The app edited the configuration: put it into effect and write it to the file.
@@ -232,6 +326,8 @@ final class Daemon {
         swallowed.removeAll()
         swallowedButtons.removeAll()
         applyModes()
+        remapper.devicesChanged()
+        applyKeyRemap()
         updateTap()
         lighting.update(targets: devices.devices.compactMap { device in
             guard let control = device.control else { return nil }
@@ -245,8 +341,12 @@ final class Daemon {
         modeOverride[kind] ?? ((config.driverMode[kind] ?? false) ? .driver : .normal)
     }
 
+    /// How long a change of device mode waits for the device's buttons to come up.
+    private static let modeWait: TimeInterval = 2
+    private var modeRetryPending = false
+
     private func applyModes() {
-        var changed = false
+        var changed = false, waiting = false
         for device in devices.devices {
             guard let control = device.control else { continue }
             let wanted = wantedMode(device.kind)
@@ -254,11 +354,24 @@ final class Daemon {
                 if device.firmware == nil { device.firmware = try control.firmwareVersion() }
                 let current = try control.deviceMode()
                 if current != wanted.rawValue {
+                    // Not with a button down: the device would go on reporting it down long
+                    // after it came up (see KeySlots). A press is short, so wait for a gap —
+                    // but not for ever, for a button that is stuck already.
+                    if device.hasButtonsDown {
+                        let since = device.modeWaitSince ?? Date()
+                        device.modeWaitSince = since
+                        if Date().timeIntervalSince(since) < Self.modeWait {
+                            waiting = true
+                            continue
+                        }
+                        log("\(device.name): a button has stayed down; changing device mode regardless")
+                    }
                     try control.setDeviceMode(wanted)
                     device.rawDown.removeAll()
                     changed = true
                     log("\(device.name): device mode \(String(format: "%02x", current)) -> \(wanted)")
                 }
+                device.modeWaitSince = nil
                 device.lastModeError = nil
             } catch {
                 let message = "\(error)"
@@ -268,27 +381,240 @@ final class Daemon {
         }
         // A device that had to be put back into its mode was reset; its LEDs were too.
         if changed { lighting.invalidate() }
+        if waiting && !modeRetryPending {
+            modeRetryPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.modeRetryPending = false
+                self?.applyModes()
+            }
+        }
+    }
+
+    /// What to say about a device that reports keys down with nothing holding them.
+    private static func stuckText(_ device: RazerDevice) -> String? {
+        let names = stuckKeyNames(device)
+        guard !names.isEmpty else { return nil }
+        return "reports \(names.joined(separator: ", ")) held down with no button holding \(names.count == 1 ? "it" : "them") — unplug the device itself and plug it back in"
+    }
+
+    private static func stuckKeyNames(_ device: RazerDevice) -> [String] {
+        device.stuckKeys.sorted().map { KeyboardKeys.byUsage[$0]?.title ?? String(format: "key %02x", $0) }
+    }
+
+    // MARK: Profiles
+
+    /// The profile the rules ask for, and which rule. The most specific wins: a hero over the
+    /// game it is played in, the app in front over one that is merely running.
+    private func automaticMatch() -> (name: String, reason: ProfileReason)? {
+        guard config.autoSwitch else { return nil }
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        // A hero only counts while the game is what is being played, not behind a browser.
+        if let hero = dota.hero, front == DotaWatcher.bundleID, let profile = config.profiles.first(where: { $0.heroes.contains(hero) }) {
+            return (profile.name, .hero(hero))
+        }
+        if let front, let profile = config.profiles.first(where: { $0.apps.contains(front) }) {
+            return (profile.name, .appInFront(front))
+        }
+        let background = config.profiles.filter { $0.whileRunning && !$0.apps.isEmpty }
+        if !background.isEmpty {
+            let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+            for profile in background {
+                if let app = profile.apps.first(where: running.contains) { return (profile.name, .appRunning(app)) }
+            }
+        }
+        return nil
+    }
+
+    /// Works out which profile is in force and puts its assignments into effect. Called
+    /// whenever anything it depends on may have changed; `byHand` when that was the user
+    /// switching profile.
+    private func refreshProfile(byHand: Bool = false) {
+        let match = automaticMatch()
+        if match?.name != automaticProfile { isOverruled = false }
+        automaticProfile = match?.name
+
+        var reason = isOverruled ? ProfileReason.chosen : (match?.reason ?? .chosen)
+        // By its name as the config has it; a profile that has since been deleted is no profile.
+        let wanted = isOverruled ? overrulingProfile : (match?.name ?? chosenProfile)
+        let name = wanted.flatMap { config.profile(named: $0)?.name }
+        if name == nil { reason = .chosen }
+
+        let changed = name != activeProfile
+        func isHero(_ reason: ProfileReason) -> Bool { if case .hero = reason { return true } else { return false } }
+        // A hero's profile coming on, or going off when the match ends, is news. So is a switch
+        // by hand, which otherwise happens blind.
+        let isNews = byHand || isHero(reason) || isHero(profileReason)
+        activeProfile = name
+        profileReason = reason
+        layer = config.layer(for: name)
+        applyKeyRemap()
+        updateTap()
+        if changed {
+            log("profile: \(name ?? Profile.defaultName) (\(reason.text))")
+            if config.profileNotes == .always || (config.profileNotes == .notApps && isNews) {
+                onProfileChanged?(name ?? Profile.defaultName, reason.text)
+            }
+        }
+        onStateChanged?()
+    }
+
+    private var profileLine: String {
+        "profile: \(activeProfile ?? Profile.defaultName) (\(profileReason.text))"
+    }
+
+    /// Switches profile by hand: a profile's name, "default", "next", "previous", or "auto" to
+    /// hand the choice back to the rules. Returns a line saying where that leaves things.
+    @discardableResult
+    func switchProfile(_ word: String) -> String {
+        let names: [String?] = [nil] + config.profiles.map { Optional($0.name) }
+        let target: String?
+        switch word.lowercased() {
+        case "auto":
+            isOverruled = false
+            refreshProfile(byHand: true)
+            return profileLine
+        case "next", "previous":
+            guard names.count > 1 else { return "there are no profiles to switch between" }
+            let index = names.firstIndex(of: activeProfile) ?? 0
+            target = names[(index + (word.lowercased() == "next" ? 1 : names.count - 1)) % names.count]
+        case "default":
+            target = nil
+        default:
+            guard let profile = config.profile(named: word) else { return "there is no profile named \"\(word)\"" }
+            target = profile.name
+        }
+        if automaticProfile != nil {
+            // A rule is in force: this overrules it, until the rules ask for something else.
+            isOverruled = target != automaticProfile
+            overrulingProfile = target
+        } else {
+            chosenProfile = target
+        }
+        refreshProfile(byHand: true)
+        return profileLine
+    }
+
+    /// A profile was renamed in the window: follow it, where it is the one chosen by hand.
+    func profileRenamed(from old: String, to new: String) {
+        if chosenProfile == old { chosenProfile = new }
+        if overrulingProfile == old { overrulingProfile = new }
+        refreshProfile()
+    }
+
+    private func profilesText() -> String {
+        var lines = [profileLine + (isOverruled ? " — the rules ask for \(automaticProfile ?? Profile.defaultName); `rzmacro profile auto` goes back to them" : "")]
+        if !config.autoSwitch { lines.append("automatic switching is off") }
+        func line(_ name: String?, _ detail: String) -> String {
+            "\(name == activeProfile ? "*" : " ") \(name ?? Profile.defaultName)\(detail.isEmpty ? "" : "  — \(detail)")"
+        }
+        lines.append(line(nil, "\(config.bindings.count) assignments"))
+        for profile in config.profiles {
+            var rules: [String] = []
+            if !profile.apps.isEmpty { rules.append("\(profile.whileRunning ? "while running" : "in front"): \(profile.apps.map(appDisplayName).joined(separator: ", "))") }
+            if !profile.heroes.isEmpty { rules.append("heroes: \(profile.heroes.map(DotaHeroes.title).joined(separator: ", "))") }
+            if let base = profile.basedOn, base != Profile.defaultName { rules.append("based on \(base)") }
+            if profile.basedOn == nil { rules.append("stands alone") }
+            lines.append(line(profile.name, (["\(profile.bindings.count) assignments"] + rules).joined(separator: "; ")))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: Keyboard keys
+
+    private var keyboardProducts: Set<Int> {
+        Set(devices.devices.filter { $0.kind == .keyboard }.map(\.productID))
+    }
+
+    /// Tells the keyboard driver what the profile makes of the keyboard's ordinary keys: a key
+    /// that is simply another key becomes it; one that does anything else stops being a key
+    /// at all, and its assignment is run from `handle` like any button's.
+    private func applyKeyRemap() {
+        var map: [UInt8: UInt64] = [:]
+        for (trigger, assignment) in layer where trigger.isOrdinaryKey && !isRecordingKeys {
+            guard case .key(let usage) = trigger.source else { continue }
+            if let target = assignment.remapTarget {
+                map[usage] = target
+            } else if accessibility || assignment.steps.isEmpty {
+                // Without Accessibility nothing could be typed in the key's place: leave it a key.
+                map[usage] = KeyRemapper.nothing
+            }
+        }
+        let before = remapper.status
+        remapper.apply(map, products: keyboardProducts)
+        if remapper.status != before { log("keyboard keys: \(remapper.status)") }
+    }
+
+    // MARK: Dota 2
+
+    var dotaStatus: DotaWatcher.Status { dota.status }
+
+    /// Adds RZMacro's settings file to the game. Returns what went wrong, if anything did.
+    func setUpDota() -> String? {
+        do { try dota.install() } catch { return "\(error)" }
+        onStateChanged?()
+        return nil
+    }
+
+    func removeDota() {
+        dota.uninstall()
+        refreshProfile()
+    }
+
+    private func dotaText() -> String {
+        let status = dota.status
+        guard status.found else { return "dota: the game was not found in the Steam library" }
+        guard status.installed else { return "dota: hero detection is not set up (`rzmacro dota setup`, or the Profiles page)" }
+        var parts = ["hero detection on"]
+        if let error = status.error { parts.append("NOT LISTENING: \(error)") } else if let port = status.port { parts.append("listening on 127.0.0.1:\(port)") }
+        if let hero = status.hero {
+            parts.append("playing \(DotaHeroes.title(hero))")
+        } else if status.receiving {
+            parts.append("game connected, no hero")
+        } else {
+            parts.append(status.running ? "game running but not reporting" : "game not running")
+        }
+        switch DotaWatcher.hasLaunchOption() {
+        case true?: break
+        case false?: parts.append("launch option \(DotaWatcher.launchOption) is MISSING")
+        case nil: parts.append("launch option \(DotaWatcher.launchOption) needed")
+        }
+        return "dota: " + parts.joined(separator: "; ")
     }
 
     // MARK: Button events
 
-    private func lookup(_ trigger: Trigger) -> Assignment? {
-        if let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-           let binding = config.apps[bundleID]?[trigger] {
-            return binding
-        }
-        return config.bindings[trigger]
-    }
+    private func lookup(_ trigger: Trigger) -> Assignment? { layer[trigger] }
 
     private func handle(_ device: RazerDevice, _ source: KeySource, _ pressed: Bool) {
         let trigger = Trigger(kind: device.kind, source: source)
-        onButton?(trigger, pressed)
-        if !sniffers.isEmpty {
-            let name = trigger.displayName == trigger.description ? "" : "  (\(trigger.displayName))"
-            broadcast("event   \(trigger) \(pressed ? "down" : "up")\(name)")
+        if trigger.isOrdinaryKey {
+            // Typing is nobody's business: a key is looked at only if it has been given
+            // something to do, or the window is asking which key is meant.
+            if !verboseSniffers.isEmpty { broadcast("key     \(trigger.displayName) \(pressed ? "down" : "up")", verboseOnly: true) }
+            if pressed, let pick = onKeyPick {
+                onKeyPick = nil
+                return pick(trigger)
+            }
+            if pressed && isRecordingKeys { return }
+            if pressed, lookup(trigger) != nil {
+                shownDown.insert(trigger)
+                onButton?(trigger, true)
+            } else if !pressed, shownDown.remove(trigger) != nil {
+                onButton?(trigger, false)
+            }
+        } else {
+            onButton?(trigger, pressed)
+            if !sniffers.isEmpty {
+                let name = trigger.displayName == trigger.description ? "" : "  (\(trigger.displayName))"
+                // On the way down, what it is about to run, and under which profile.
+                let runs = pressed ? lookup(trigger).map { "  → \($0.summary) [\(activeProfile ?? Profile.defaultName)]" } ?? "" : ""
+                broadcast("event   \(trigger) \(pressed ? "down" : "up")\(name)\(runs)")
+            }
         }
         if pressed {
             if let binding = lookup(trigger) {
+                // A key that is simply another key is the keyboard driver's doing (see applyKeyRemap).
+                if trigger.isOrdinaryKey && binding.remapTarget != nil { return }
                 active[trigger] = binding
                 engine.press(id: trigger.description, assignment: binding)
             } else if device.kind == .keyboard, case .raw(let code) = source, let key = Self.builtinMedia[code] {
@@ -360,7 +686,7 @@ final class Daemon {
 
     /// The kinds of event that have to be looked at, given what is bound.
     private var tappedEvents: [CGEventType] {
-        let bound = ([config.bindings] + Array(config.apps.values)).flatMap(\.keys).filter { $0.kind == .mouse }.map(\.source)
+        let bound = layer.keys.filter { $0.kind == .mouse }.map(\.source)
         var events: [CGEventType] = []
         if fnLayerActive || bound.contains(where: { if case .key = $0 { return true } else { return false } }) {
             events += [.keyDown, .keyUp]
@@ -455,8 +781,8 @@ final class Daemon {
 
     // MARK: Sniffing
 
-    private func broadcast(_ line: String, verboseOnly: Bool = false) {
-        let stamp = String(format: "%9.3f ", Date().timeIntervalSince(started))
+    private func broadcast(_ line: String, verboseOnly: Bool = false, at moment: Date = Date()) {
+        let stamp = String(format: "%9.3f ", moment.timeIntervalSince(started))
         if verboseOnly {
             verboseSniffers.removeAll { !$0.send(stamp + line) }
         } else {
@@ -495,6 +821,8 @@ final class Daemon {
         let productID: Int
         let firmware: String?
         let inDriverMode: Bool
+        /// Names of the keys the device reports down with nothing holding them.
+        let stuckKeys: [String]
         let interfaces: [Interface]
     }
 
@@ -504,6 +832,7 @@ final class Daemon {
                 id: "\(device.productID)-\(device.locationID)", kind: device.kind, name: device.name,
                 productID: device.productID, firmware: device.firmware,
                 inDriverMode: wantedMode(device.kind) == .driver && device.lastModeError == nil && device.control != nil,
+                stuckKeys: Self.stuckKeyNames(device),
                 interfaces: device.interfaces.map {
                     .init(id: $0.number, role: $0.role, state: Self.describe($0), ok: $0.openResult == kIOReturnSuccess)
                 })
@@ -533,8 +862,11 @@ final class Daemon {
         lines.append("permissions: input-monitoring=\(inputMonitoring ? "granted" : "MISSING")  accessibility=\(accessibility ? "granted" : "MISSING")  event-tap=\(tap.isRunning ? "on" : "off")")
         lines.append("config: \(Paths.configFile.path)")
         if let configError { lines.append("  CONFIG ERROR: \(configError)") }
-        lines.append("  \(config.bindings.count) bindings, \(config.apps.count) app profiles")
+        lines.append("  \(config.bindings.count) bindings, \(config.profiles.count) profiles")
         for trigger in config.bindings.keys.map(\.displayName).sorted() { lines.append("    \(trigger)") }
+        lines.append(profileLine)
+        lines.append("keyboard keys: \(remapper.status)")
+        lines.append(dotaText())
         lines.append("lighting: \(lighting.status)")
         lines.append("devices:")
         if devices.devices.isEmpty { lines.append("  (none)") }
@@ -552,6 +884,16 @@ final class Daemon {
             for interface in device.interfaces {
                 lines.append("      if\(interface.number) \(interface.role): \(Self.describe(interface))")
             }
+            if device.kind == .mouse {
+                // What the mouse says its buttons are typing right now. With no button down this
+                // should be nothing; a key that stays is one the mouse has stuck (see KeySlots).
+                let down = device.interfaces.reduce(into: Set<Int>()) { if $1.isKeyboard { $0.formUnion($1.usagesDownNow()) } }
+                if !down.isEmpty {
+                    let names = down.sorted().map { UInt8(exactly: $0).flatMap { KeyboardKeys.byUsage[$0]?.title } ?? String(format: "key %02x", $0) }
+                    lines.append("      keys reported down now: \(names.joined(separator: ", "))")
+                }
+            }
+            if let stuck = Self.stuckText(device) { lines.append("      STUCK KEYS: \(stuck)") }
         }
         return lines.joined(separator: "\n")
     }
@@ -574,7 +916,7 @@ final class Daemon {
             reply(statusText())
         case "reload":
             reloadConfig()
-            reply(configError.map { "config error: \($0)" } ?? "config reloaded: \(config.bindings.count) bindings, \(config.apps.count) app profiles")
+            reply(configError.map { "config error: \($0)" } ?? "config reloaded: \(config.bindings.count) bindings, \(config.profiles.count) profiles")
         case "quit":
             reply("stopping")
             shutdown()
@@ -590,6 +932,17 @@ final class Daemon {
                 engine.release(id: trigger.description, assignment: assignment)
             }
             reply("pressed \(trigger.displayName) for \(held) ms")
+        case "profile":
+            // profile [<name>|default|next|previous|auto]
+            guard parts.count > 1 else { return reply(profilesText()) }
+            reply(switchProfile(parts.dropFirst().joined(separator: " ")))
+        case "dota":
+            // dota [setup|remove]
+            switch parts[safe: 1] {
+            case "setup": reply(setUpDota().map { "error: \($0)" } ?? "\(dotaText())\nrestart Dota 2 for it to take effect")
+            case "remove": removeDota(); reply(dotaText())
+            default: reply(dotaText())
+            }
         case "show":
             onShowWindow?()
             reply("ok")

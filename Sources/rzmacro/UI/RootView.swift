@@ -19,6 +19,7 @@ struct RootView: View {
                     switch model.page {
                     case .keyboard: DevicePage(model: model, kind: .keyboard)
                     case .mouse: DevicePage(model: model, kind: .mouse)
+                    case .profiles: ProfilesPage(model: model)
                     case .macros: MacrosPage(model: model)
                     case .lighting: LightingPage(model: model)
                     case .settings: SettingsPage(model: model)
@@ -94,6 +95,13 @@ private struct Sidebar: View {
             deviceItem(.mouse, page: .mouse)
 
             SectionLabel("Library").padding(.horizontal, 10).padding(.top, 18).padding(.bottom, 4)
+            SidebarItem(
+                icon: "square.stack.3d.up.fill", title: "Profiles",
+                // Which one is in use, once there is more than the default to be in use.
+                detail: model.config.profiles.isEmpty ? nil : "In use: \(model.activeProfile ?? Profile.defaultName)",
+                trailing: model.config.profiles.isEmpty ? nil : "\(model.config.profiles.count)",
+                isSelected: model.page == .profiles
+            ) { model.page = .profiles }
             SidebarItem(
                 icon: "bolt.fill", title: "Macros", detail: nil,
                 trailing: model.config.macros.isEmpty ? nil : "\(model.config.macros.count)",
