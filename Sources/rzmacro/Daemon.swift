@@ -43,7 +43,7 @@ extension Config {
 }
 
 final class Daemon {
-    static let version = "0.3.0"
+    static let version = "0.4.0"
 
     /// Media controls the keyboard hands to software in driver mode; translated unless rebound.
     private static let builtinMedia: [UInt8: MediaKey] = [
