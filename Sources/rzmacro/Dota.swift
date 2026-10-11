@@ -1,7 +1,12 @@
 import AppKit
 import Network
 
-/// Which Dota 2 hero is being played, so a profile can follow it.
+/// What the game says it is doing: playing a match, or showing its menus.
+enum DotaActivity: String, CaseIterable {
+    case playing, menu
+}
+
+/// Which Dota 2 hero is being played, and whether a match is on, so a profile can follow them.
 ///
 /// Dota tells whoever asks: its Game State Integration posts the state of the match as JSON to
 /// the addresses listed in small settings files in its `cfg/gamestate_integration` folder. This
@@ -30,11 +35,14 @@ final class DotaWatcher {
         /// The game has reported in the last little while.
         var receiving = false
         var hero: String?
+        var activity: DotaActivity?
     }
 
     /// The hero being played, by internal name without the "npc_dota_hero_" prefix.
     private(set) var hero: String?
-    /// Called on the main queue when the hero changes.
+    /// What the game last said it was doing, if it said.
+    private var reported: DotaActivity?
+    /// Called on the main queue when the hero changes, or what the game says it is doing.
     var onChange: (() -> Void)?
 
     private var listener: NWListener?
@@ -42,6 +50,8 @@ final class DotaWatcher {
     private var token: String?
     private var error: String?
     private var lastUpdate: Date?
+    /// Whether the game, by process, was started so as to tell us what it is doing.
+    private var canTell: (pid: pid_t, answer: Bool)?
 
     // MARK: Finding the game
 
@@ -106,18 +116,11 @@ final class DotaWatcher {
         }
     }
 
-    /// Adds the settings file to the game and starts listening. Dota reads the file when it
-    /// starts, so a running game has to be restarted.
-    func install() throws {
-        guard let file = Self.settingsFile else { throw ConfigError("Dota 2 was not found in the Steam library on this Mac") }
-        stop()
-        guard let port = (Self.firstPort..<Self.firstPort + 20).first(where: Self.isFree) else {
-            throw ConfigError("no free port to listen on near \(Self.firstPort)")
-        }
-        let token = UUID().uuidString
-        // Fields as Valve documents them. Only the hero is asked for, once a second at most.
+    /// Fields as Valve documents them. The hero and the player's own state are asked for, once
+    /// a second at most.
+    private static func write(_ file: URL, port: UInt16, token: String) throws {
         let settings = """
-        "RZMacro: tells RZMacro which hero is being played, so it can switch profile"
+        "RZMacro: tells RZMacro which hero is being played and whether a match is on, so it can switch profile"
         {
             "uri"        "http://127.0.0.1:\(port)/"
             "timeout"    "5.0"
@@ -131,6 +134,7 @@ final class DotaWatcher {
             "data"
             {
                 "provider"  "1"
+                "player"    "1"
                 "hero"      "1"
             }
         }
@@ -142,6 +146,25 @@ final class DotaWatcher {
         } catch {
             throw ConfigError("could not write \(file.path): \(error.localizedDescription)")
         }
+    }
+
+    /// A settings file from before the player's state was asked for is written again, with
+    /// the port and token it has. The game reads it the next time it starts.
+    private static func bringUpToDate() {
+        guard let file = settingsFile, let text = try? String(contentsOf: file, encoding: .utf8), !text.contains("\"player\""),
+              let installed = installed(), let token = installed.token else { return }
+        if (try? write(file, port: installed.port, token: token)) != nil { log("dota: settings file brought up to date (it now asks whether a match is on)") }
+    }
+
+    /// Adds the settings file to the game and starts listening. Dota reads the file when it
+    /// starts, so a running game has to be restarted.
+    func install() throws {
+        guard let file = Self.settingsFile else { throw ConfigError("Dota 2 was not found in the Steam library on this Mac") }
+        stop()
+        guard let port = (Self.firstPort..<Self.firstPort + 20).first(where: Self.isFree) else {
+            throw ConfigError("no free port to listen on near \(Self.firstPort)")
+        }
+        try Self.write(file, port: port, token: UUID().uuidString)
         log("dota: wrote \(file.path)")
         start()
     }
@@ -159,7 +182,9 @@ final class DotaWatcher {
 
     /// Starts listening if the settings file is in place and nothing is listening yet.
     func start() {
-        guard listener == nil, let installed = Self.installed(), let endpoint = NWEndpoint.Port(rawValue: installed.port) else { return }
+        guard listener == nil else { return }
+        Self.bringUpToDate()
+        guard let installed = Self.installed(), let endpoint = NWEndpoint.Port(rawValue: installed.port) else { return }
         port = installed.port
         token = installed.token
         error = nil
@@ -193,12 +218,14 @@ final class DotaWatcher {
         port = nil
         error = nil
         lastUpdate = nil
+        reported = nil
         setHero(nil)
     }
 
     /// The game went away: whoever was being played no longer is.
     func gameQuit() {
         lastUpdate = nil
+        reported = nil
         setHero(nil)
     }
 
@@ -249,22 +276,46 @@ final class DotaWatcher {
         guard let state = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return }
         // Anything on this Mac can post to the port; only the game knows the token.
         if let token, (state["auth"] as? [String: Any])?["token"] as? String != token { return }
-        let wasReceiving = isReceiving
+        let wasReceiving = isReceiving, wasDoing = activity
         lastUpdate = Date()
         // In the menus there is no hero at all; a spectator gets every player's, under other names.
         let name = (state["hero"] as? [String: Any])?["name"] as? String
+        // A spectator gets every player's state, under other names: that is not playing either.
+        let said = (state["player"] as? [String: Any])?["activity"] as? String
+        if said.flatMap(DotaActivity.init(rawValue:)) != reported || !wasReceiving { log("dota: the game says \(said.map { "\"\($0)\"" } ?? "nothing of what it is doing")") }
+        reported = said.flatMap(DotaActivity.init(rawValue:))
+        let heroBefore = hero
         setHero(name.map(DotaHeroes.shortName))
-        if !wasReceiving { onChange?() }
+        // `setHero` has said so already if the hero changed.
+        if hero == heroBefore && (!wasReceiving || activity != wasDoing) { onChange?() }
     }
 
     /// The game checks in every ten seconds even when nothing happens.
     private var isReceiving: Bool { lastUpdate.map { Date().timeIntervalSince($0) < 45 } ?? false }
 
+    /// What the game is doing, as far as it can be told: a match for as long as it keeps
+    /// saying so — two missed check-ins and it no longer is — and otherwise its menus, where
+    /// it says so, or says nothing at all. nil when it can't be told: no game, or one that was
+    /// started without being asked to say.
+    var activity: DotaActivity? {
+        guard listener != nil, let game = Self.runningGame else { return nil }
+        if canTell?.pid != game.processIdentifier {
+            // It reads the settings file when it starts, and only reports with its launch option.
+            // If when it started can't be told, the file is taken to be the one it read.
+            let written = Self.settingsFile.map(Self.modified) ?? .distantFuture
+            let read = Self.startDate(game.processIdentifier).map { $0 > written } ?? (written != .distantFuture)
+            canTell = (game.processIdentifier, read && Self.processArguments(game.processIdentifier).contains(Self.launchOption))
+        }
+        guard canTell?.answer == true else { return nil }
+        let fresh = lastUpdate.map { Date().timeIntervalSince($0) < 25 } ?? false
+        return fresh && reported == .playing ? .playing : .menu
+    }
+
     var status: Status {
         Status(
             found: Self.gameDirectory() != nil,
             installed: Self.settingsFile.map { FileManager.default.fileExists(atPath: $0.path) } ?? false,
-            port: port, error: error, running: Self.isRunning, receiving: isReceiving, hero: hero)
+            port: port, error: error, running: Self.isRunning, receiving: isReceiving, hero: hero, activity: activity)
     }
 
     // MARK: The launch option
@@ -293,6 +344,17 @@ final class DotaWatcher {
 
     private static func modified(_ url: URL) -> Date {
         (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+
+    /// When a process was started. (`NSRunningApplication.launchDate` is only there for what
+    /// LaunchServices started, which a game started by Steam is not.)
+    private static func startDate(_ pid: pid_t) -> Date? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&name, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let started = info.kp_proc.p_starttime
+        return Date(timeIntervalSince1970: TimeInterval(started.tv_sec) + TimeInterval(started.tv_usec) / 1_000_000)
     }
 
     /// The command line of one of the user's own processes.
@@ -397,6 +459,27 @@ enum DotaHeroes {
         let wanted = text.lowercased().filter { $0.isLetter || $0.isNumber }
         if let match = all.first(where: { $0.title.lowercased().filter { $0.isLetter || $0.isNumber } == wanted }) { return match.name }
         return shortName(text)
+    }
+
+    /// The heroes a few typed letters could mean, the likeliest first: names that start with
+    /// them, then names with a word that does or whose initials they are ("am" is Anti-Mage),
+    /// then names that merely have them somewhere.
+    static func search(_ text: String) -> [(name: String, title: String)] {
+        func plain(_ text: String) -> String { text.lowercased().filter { $0.isLetter || $0.isNumber || $0 == " " } }
+        let typed = plain(text).trimmingCharacters(in: .whitespaces)
+        guard !typed.isEmpty else { return [] }
+        let squeezed = typed.filter { $0 != " " }
+        func rank(_ hero: (name: String, title: String)) -> Int? {
+            let title = plain(hero.title.replacingOccurrences(of: "-", with: " "))
+            let words = title.split(separator: " ")
+            if title.hasPrefix(typed) || title.filter({ $0 != " " }).hasPrefix(squeezed) { return 0 }
+            if words.contains(where: { $0.hasPrefix(typed) }) || String(words.compactMap(\.first)) == squeezed { return 1 }
+            if title.contains(typed) || hero.name.replacingOccurrences(of: "_", with: " ").contains(typed) { return 2 }
+            return nil
+        }
+        return all.compactMap { hero in rank(hero).map { (hero, $0) } }
+            .sorted { ($0.1, $0.0.title) < ($1.1, $1.0.title) }
+            .map(\.0)
     }
 
     static let all: [(name: String, title: String)] = [

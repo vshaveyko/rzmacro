@@ -18,7 +18,8 @@ func usage() -> Never {
       light brightness <N|+N|-N>
       profile [<name>|default|next|previous|auto]
                              list the profiles, or switch to one by hand ("auto" goes back
-                             to whatever the running app or game asks for)
+                             to whatever the running app or game asks for; a partial
+                             profile's name switches it on, or off again)
       dota [setup|remove]    Dota 2 hero detection: its state, switch it on, switch it off
       press <button> [ms]    run what a button is assigned to, as if it were held that long
       sniff [seconds] [all]  print button events as you press them, and every key the macros

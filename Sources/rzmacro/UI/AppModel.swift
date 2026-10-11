@@ -56,6 +56,8 @@ final class AppModel: ObservableObject {
     @Published var profileReason = ""
     /// The profile was chosen by hand over what an app, game or hero asks for.
     @Published var isOverruled = false
+    /// The partial profiles that are on right now, on top of that one.
+    @Published var activePartials: [Daemon.ActivePartial] = []
     @Published var dota = DotaWatcher.Status()
     /// Whether Dota 2 is started with the launch option hero detection needs; nil if unknown.
     @Published var dotaLaunchOption: Bool?
@@ -69,6 +71,10 @@ final class AppModel: ObservableObject {
     /// Every special button pressed since launch, so models without a layout can list theirs.
     @Published var seenButtons: [Trigger] = []
     @Published var devices: [Daemon.DeviceSummary] = []
+    /// Keyboards plugged in that are not Razer's, looked after or not.
+    @Published var otherKeyboards: [DeviceManager.OtherKeyboardSeen] = []
+    /// Which device a page shows, where several of its kind are connected (a summary's id).
+    @Published var shownDevice: [DeviceKind: String] = [:]
     @Published var inputMonitoring = false
     @Published var accessibility = false
     @Published var configError: String?
@@ -120,12 +126,14 @@ final class AppModel: ObservableObject {
         if !isPreviewing && config != daemon.config { config = daemon.config }
         isSyncing = false
         devices = daemon.deviceSummaries
+        otherKeyboards = daemon.otherKeyboards
         inputMonitoring = daemon.inputMonitoring
         accessibility = daemon.accessibility
         configError = daemon.configError
         activeProfile = daemon.activeProfile
         profileReason = daemon.profileReason.text
         isOverruled = daemon.isOverruled
+        activePartials = daemon.activePartials
         dota = daemon.dotaStatus
     }
 
@@ -205,7 +213,9 @@ final class AppModel: ObservableObject {
 
     /// The connected model's profile; with nothing plugged in, the one the page usually shows.
     func profile(for kind: DeviceKind) -> DeviceProfile {
-        device(kind).map { DeviceProfile.profile(productID: $0.productID, kind: kind) } ?? DeviceProfile.preferred(for: kind)
+        guard let device = device(kind) else { return DeviceProfile.preferred(for: kind) }
+        // Another make's keyboard has no special buttons, whatever its product number says.
+        return device.isRazer ? DeviceProfile.profile(productID: device.productID, kind: kind) : DeviceProfile.generic(kind)
     }
 
     /// Every button of a kind worth listing: the model's special ones, any others that are
@@ -215,10 +225,11 @@ final class AppModel: ObservableObject {
         let listed = profile(for: kind).keys.map { DeviceKey($0, kind: kind) }
         let known = Set(listed.map(\.trigger))
         var seen = Set<Trigger>()
-        let special = (config.allBindings.flatMap(\.keys) + seenButtons)
+        // Another make's keyboard has none of the special buttons the Razer one's are bound to.
+        let special = device(kind)?.isRazer == false ? [] : (config.allBindings.flatMap(\.keys) + seenButtons)
             .filter { $0.kind == kind && !$0.isOrdinaryKey && !known.contains($0) && seen.insert($0).inserted }
             .sorted { $0.description < $1.description }
-        let ordinary = (Array(config.layer(for: editing).keys) + (selectedButton[kind].map { [$0] } ?? []))
+        let ordinary = (Array(shownLayer(for: editing).keys) + (selectedButton[kind].map { [$0] } ?? []))
             .filter { $0.kind == kind && $0.isOrdinaryKey && seen.insert($0).inserted }
             .sorted { $0.description < $1.description }
         return listed + (special + ordinary).map(DeviceKey.init(unlisted:))
@@ -238,7 +249,51 @@ final class AppModel: ObservableObject {
         isPickingKey = false
     }
 
-    func device(_ kind: DeviceKind) -> Daemon.DeviceSummary? { devices.first { $0.kind == kind } }
+    func devices(of kind: DeviceKind) -> [Daemon.DeviceSummary] { devices.filter { $0.kind == kind } }
+
+    /// The device a page shows: the one chosen, else a Razer one, else whatever there is.
+    func device(_ kind: DeviceKind) -> Daemon.DeviceSummary? {
+        let candidates = devices(of: kind)
+        return candidates.first { $0.id == shownDevice[kind] } ?? candidates.first(where: \.isRazer) ?? candidates.first
+    }
+
+    // MARK: Other keyboards
+
+    /// A keyboard that is not Razer's: one that is plugged in, or one RZMacro has been told to
+    /// look after and that isn't.
+    struct OtherKeyboardRow: Identifiable {
+        let id: DeviceID
+        let name: String
+        let isBuiltIn: Bool
+        let isConnected: Bool
+        let isOn: Bool
+    }
+
+    var otherKeyboardRows: [OtherKeyboardRow] {
+        let wanted = Set(config.keyboards.map(\.id))
+        let plugged = otherKeyboards.map { OtherKeyboardRow(id: $0.id, name: $0.name, isBuiltIn: $0.isBuiltIn, isConnected: true, isOn: wanted.contains($0.id)) }
+        let away = config.keyboards.filter { keyboard in !otherKeyboards.contains { $0.id == keyboard.id } }
+            .map { OtherKeyboardRow(id: $0.id, name: $0.name, isBuiltIn: false, isConnected: false, isOn: true) }
+        return plugged + away
+    }
+
+    /// Starts or stops looking after a keyboard that is not Razer's.
+    func setOtherKeyboard(_ row: OtherKeyboardRow, on: Bool) {
+        config.keyboards.removeAll { $0.id == row.id }
+        if on { config.keyboards.append(OtherKeyboard(id: row.id, name: row.name)) }
+    }
+
+    /// How much of a keyboard to draw for a device. Razer's are full size; another make's is
+    /// what its entry says.
+    func shape(of device: Daemon.DeviceSummary?) -> KeyboardShape {
+        guard let device, !device.isRazer else { return .full }
+        return config.keyboards.first { $0.id.description == device.usbID }?.shape ?? .full
+    }
+
+    func setShape(_ shape: KeyboardShape, of device: Daemon.DeviceSummary) {
+        guard let index = config.keyboards.firstIndex(where: { $0.id.description == device.usbID }) else { return }
+        config.keyboards[index].shape = shape
+    }
 
     // MARK: Assignments
 
@@ -248,9 +303,35 @@ final class AppModel: ObservableObject {
     }
 
     /// What a button does under a profile, counting what the profile is based on, and which
-    /// profile says so.
+    /// profile says so. A partial profile is based on whichever profile is in use at the moment.
     func effective(_ trigger: Trigger, profile: String?) -> (assignment: Assignment, from: String?)? {
-        config.assignment(for: trigger, in: profile)
+        if let profile, isPartial(profile), config.bindings(of: profile)[trigger] == nil {
+            return config.assignment(for: trigger, in: activeProfile)
+        }
+        return config.assignment(for: trigger, in: profile)
+    }
+
+    /// The partial profile that decides a button right now over the profile given, where that
+    /// one is in use: one that is on, and above it.
+    func partialOver(_ trigger: Trigger, profile: String?) -> (name: String, assignment: Assignment)? {
+        let above: ArraySlice<Daemon.ActivePartial>
+        if let index = activePartials.firstIndex(where: { $0.name == profile }) {
+            above = activePartials[..<index]
+        } else if profile == activeProfile {
+            above = activePartials[...]
+        } else {
+            return nil
+        }
+        for partial in above {
+            if let assignment = config.bindings(of: partial.name)[trigger] { return (partial.name, assignment) }
+        }
+        return nil
+    }
+
+    /// Every assignment `effective` would report under a profile.
+    func shownLayer(for profile: String?) -> [Trigger: Assignment] {
+        guard let profile, isPartial(profile) else { return config.layer(for: profile) }
+        return config.layer(for: activeProfile, under: [profile])
     }
 
     func setAssignment(_ assignment: Assignment?, for trigger: Trigger, profile: String?) {
@@ -268,19 +349,46 @@ final class AppModel: ObservableObject {
         change(&config.profiles[index])
     }
 
+    func isPartial(_ name: String) -> Bool { config.profile(named: name)?.partial == true }
+
+    /// Why a partial profile is on, or nil if it is off.
+    func partialReason(_ name: String) -> String? { activePartials.first { $0.name == name }?.text }
+
+    /// Whether a profile is doing anything right now: the one in use, or a partial one that is on.
+    func isInUse(_ name: String?) -> Bool { activeProfile == name || activePartials.contains { $0.name == name } }
+
+    /// Makes a profile a partial one, or a whole one again.
+    func setPartial(_ name: String, _ partial: Bool) {
+        guard let profile = config.profile(named: name), profile.partial != partial else { return }
+        var updated = config
+        updated.profiles = updated.profiles.map { other in
+            var copy = other
+            if other.name == profile.name {
+                copy.partial = partial
+                copy.basedOn = Profile.defaultName
+            } else if partial, other.basedOn == profile.name {
+                // Nothing can be based on a partial profile: on what it was based on, then.
+                copy.basedOn = profile.basedOn
+            }
+            return copy
+        }
+        config = updated
+    }
+
     /// Adds a profile and makes it the one being edited. A taken name gets a number.
     @discardableResult
-    func addProfile(named wanted: String? = nil, apps: [String] = [], heroes: [String] = []) -> String {
-        let base = wanted ?? "Profile"
-        var name = wanted ?? "Profile 1"
+    func addProfile(named wanted: String? = nil, apps: [String] = [], heroes: [String] = [], partial: Bool = false) -> String {
+        let base = wanted ?? (partial ? "Partial" : "Profile")
+        var name = wanted ?? "\(base) 1"
         var suffix = 2
         while config.profile(named: name) != nil || Profile.reservedNames.contains(name.lowercased()) {
             name = "\(base) \(suffix)"
             suffix += 1
         }
-        var profile = Profile(name: name, apps: apps, heroes: heroes)
+        var profile = Profile(name: name, partial: partial, apps: apps, heroes: heroes)
+        profile.tidyDotaRules()
         // A hero's profile builds on the game's, where there is one.
-        if !heroes.isEmpty, let game = config.profiles.first(where: { $0.apps.contains(DotaWatcher.bundleID) }) {
+        if !partial, !heroes.isEmpty, let game = config.profiles.first(where: { !$0.partial && $0.heroes.isEmpty && $0.apps.contains(DotaWatcher.bundleID) }) {
             profile.basedOn = game.name
         }
         config.profiles.append(profile)
@@ -310,9 +418,9 @@ final class AppModel: ObservableObject {
         }
         config = updated
         if editingProfile == old { editingProfile = new }
-        // The driver knows the profile in use by name: hand it the new configuration, then the new name.
-        flushSave()
+        // The driver knows the profiles in use by name: hand it the new name, then the new configuration.
         daemon.profileRenamed(from: old, to: new)
+        flushSave()
         return true
     }
 
@@ -332,7 +440,7 @@ final class AppModel: ObservableObject {
         config.profiles.swapAt(index, index + offset)
     }
 
-    /// Switches to a profile by hand, now.
+    /// Switches to a profile by hand, now. A partial profile is switched on, or off if it is on.
     func useProfile(_ name: String?) {
         flushSave()
         daemon.switchProfile(name ?? "default")
@@ -343,11 +451,13 @@ final class AppModel: ObservableObject {
         daemon.switchProfile("auto")
     }
 
-    /// One line on when a profile comes on by itself: "Dota 2 · Invoker, Meepo".
+    /// One line on when a profile comes on by itself: "Dota 2 · in a match · Invoker, Meepo".
     func rules(of profile: Profile) -> String {
         var parts: [String] = []
         if !profile.apps.isEmpty { parts.append(profile.apps.map(Self.appName).joined(separator: ", ") + (profile.whileRunning ? " running" : "")) }
+        if let dota = profile.dota { parts.append(dota == .playing ? "in a match" : "in the menus") }
         if !profile.heroes.isEmpty { parts.append(profile.heroes.map(DotaHeroes.title).joined(separator: ", ")) }
+        if profile.partial { return parts.isEmpty ? "Partial · switched by hand" : "Partial · " + parts.joined(separator: " · ") }
         return parts.isEmpty ? "Switched to by hand" : parts.joined(separator: " · ")
     }
 

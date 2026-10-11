@@ -3,7 +3,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// Profiles: sets of assignments, and when each is the one in use — chosen by hand, or
-/// switched on by an app, a game, or the Dota 2 hero being played.
+/// switched on by an app, a game, or the Dota 2 hero being played. Partial ones are switched
+/// on the same ways, on top of the one in use.
 struct ProfilesPage: View {
     @ObservedObject var model: AppModel
 
@@ -41,10 +42,19 @@ struct ProfilesPage: View {
             HStack {
                 Text("Profiles").font(.system(size: 24, weight: .bold))
                 Spacer()
-                Button { model.addProfile() } label: { Image(systemName: "plus").font(.system(size: 12, weight: .bold)).frame(width: 28, height: 28) }
-                    .buttonStyle(.plain)
-                    .background(Circle().fill(Theme.accent))
-                    .help("New profile")
+                Menu {
+                    Button("New Profile") { model.addProfile() }
+                    Button("New Partial Profile") { model.addProfile(partial: true) }
+                } label: {
+                    Image(systemName: "plus").font(.system(size: 12, weight: .bold)).frame(width: 28, height: 28)
+                        .background(Circle().fill(Theme.accent))
+                        .contentShape(Circle())
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("New profile, or a partial one: a few buttons changed on top of whichever profile is in use")
             }
             .padding(.horizontal, 20)
             .padding(.top, 18)
@@ -57,8 +67,8 @@ struct ProfilesPage: View {
                         onSelect: { model.editingProfile = nil })
                     ForEach(Array(model.config.profiles.enumerated()), id: \.element.name) { index, profile in
                         ProfileCard(
-                            name: profile.name, detail: model.rules(of: profile),
-                            isSelected: selection?.name == profile.name, isActive: model.activeProfile == profile.name,
+                            name: profile.name, detail: model.rules(of: profile), isPartial: profile.partial,
+                            isSelected: selection?.name == profile.name, isActive: model.isInUse(profile.name),
                             onSelect: { model.editingProfile = profile.name },
                             onMove: { model.moveProfile(profile.name, by: $0) },
                             canMoveUp: index > 0, canMoveDown: index < model.config.profiles.count - 1,
@@ -77,6 +87,7 @@ struct ProfilesPage: View {
                 .controlSize(.small)
                 Text(model.config.autoSwitch
                      ? "Apps, games and Dota heroes switch their profiles on. Where several want to, the one higher in this list wins."
+                        + (model.config.profiles.contains(where: \.partial) ? " Partial profiles go on top of it, all that apply at once." : "")
                      : "Profiles change only when you change them: here, from the menu bar, or with a button.")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.tertiary)
@@ -117,6 +128,26 @@ struct ProfilesPage: View {
                 Button("Use Now") { model.useProfile(name) }
                     .buttonStyle(PillButtonStyle(kind: .primary, compact: true))
                     .help("Switch to this profile by hand. It stays until you switch again, or an app, game or hero switches its own profile on.")
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Whether a partial profile is on, with the means to switch it.
+    private func onRow(_ profile: Profile) -> some View {
+        HStack(spacing: 8) {
+            if let reason = model.partialReason(profile.name) {
+                StatusChip(text: "On now — \(reason)", color: Theme.good, dot: true)
+                Button("Switch Off") { model.useProfile(profile.name) }
+                    .buttonStyle(PillButtonStyle(compact: true))
+                    .help(profile.isAutomatic
+                          ? "Switch it off by hand. If an app, game or hero has it on, it stays off until that one has gone and come back."
+                          : "Switch it off again.")
+            } else {
+                StatusChip(text: "Off", color: Theme.tertiary, dot: true)
+                Button("Switch On") { model.useProfile(profile.name) }
+                    .buttonStyle(PillButtonStyle(kind: .primary, compact: true))
+                    .help("Switch it on by hand, on top of whichever profile is in use. It stays on until you switch it off.")
             }
             Spacer(minLength: 0)
         }
@@ -164,18 +195,29 @@ struct ProfilesPage: View {
                         .font(.system(size: 12.5))
                         .foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Button { model.addProfile() } label: { Label("New Profile", systemImage: "plus") }
-                        .buttonStyle(PillButtonStyle(kind: .primary))
+                    Text("A partial profile changes a few buttons only, on top of whichever profile is in use: this button does something else in that app, whatever the rest are doing.")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button { model.addProfile() } label: { Label("New Profile", systemImage: "plus") }
+                            .buttonStyle(PillButtonStyle(kind: .primary))
+                        Button { model.addProfile(partial: true) } label: { Label("New Partial Profile", systemImage: "plus") }
+                            .buttonStyle(PillButtonStyle())
+                    }
                 }
             } else {
-                quickSwitching
+                quickSwitching(nil)
             }
         }
     }
 
-    private var quickSwitching: some View {
-        section("Switching by hand") {
-            Text("From the keyboard icon in the menu bar; with any button or key given the **Profile** action (next, previous, or a particular one); or from a terminal with `rzmacro profile next`.")
+    private func quickSwitching(_ partial: Profile?) -> some View {
+        let text: LocalizedStringKey = partial.map {
+            "From the keyboard icon in the menu bar; with any button or key given the **Profile** action and this profile — one press switches it on, the next off; or from a terminal with `rzmacro profile \($0.name)`."
+        } ?? "From the keyboard icon in the menu bar; with any button or key given the **Profile** action (next, previous, or a particular one); or from a terminal with `rzmacro profile next`."
+        return section("Switching by hand") {
+            Text(text)
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -193,35 +235,51 @@ struct ProfilesPage: View {
                     .focused($nameFocused)
                     .onSubmit { commitName(profile.name) }
                     .onChange(of: nameFocused) { _, focused in if !focused { commitName(profile.name) } }
-                useRow(profile.name)
+                if profile.partial { onRow(profile) } else { useRow(profile.name) }
             }
 
             section("Assignments") {
                 Text(counted(profile.bindings)).font(.system(size: 13, weight: .medium))
                 HStack(spacing: 10) {
-                    Text("Based on").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
-                    Picker("", selection: Binding(get: { profile.basedOn ?? "" }, set: { new in model.updateProfile(profile.name) { $0.basedOn = new.isEmpty ? nil : new } })) {
-                        Text(Profile.defaultName).tag(Profile.defaultName)
-                        ForEach(bases(for: profile), id: \.self) { Text($0).tag($0) }
-                        Divider()
-                        Text("Nothing").tag("")
-                    }
-                    .labelsHidden()
-                    .fixedSize()
+                    Segmented(options: [(false, "Whole profile"), (true, "Partial profile")],
+                              selection: Binding(get: { profile.partial }, set: { model.setPartial(profile.name, $0) }))
+                        .frame(width: 330)
+                    Spacer(minLength: 0)
                 }
-                Text(profile.basedOn == nil
-                     ? "This profile stands alone: a button it doesn't mention does what it does out of the box."
-                     : "A button this profile doesn't mention does what \(profile.basedOn!) says. Only what you change here is different.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Theme.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if profile.partial {
+                    Text("While it is on, the buttons assigned in it do what it says, on top of whichever profile is in use — and go on doing so when that profile changes. The other buttons are that profile's. Several partial profiles can be on at once. Where two change the same button, one switched on by hand wins, then a hero's over an app's, then the one higher in the list.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack(spacing: 10) {
+                        Text("Based on").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
+                        Picker("", selection: Binding(get: { profile.basedOn ?? "" }, set: { new in model.updateProfile(profile.name) { $0.basedOn = new.isEmpty ? nil : new } })) {
+                            Text(Profile.defaultName).tag(Profile.defaultName)
+                            ForEach(bases(for: profile), id: \.self) { Text($0).tag($0) }
+                            Divider()
+                            Text("Nothing").tag("")
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    Text(profile.basedOn == nil
+                         ? "This profile stands alone: a button it doesn't mention does what it does out of the box."
+                         : "A button this profile doesn't mention does what \(profile.basedOn!) says. Only what you change here is different.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 editButtons(profile.name)
             }
 
             section("Switch it on automatically") {
                 appRules(profile)
-                Rectangle().fill(Theme.stroke).frame(height: 1)
-                heroRules(profile)
+                // Heroes and matches are the game's own: asked of it once it is among the apps.
+                if profile.apps.contains(DotaWatcher.bundleID) {
+                    Rectangle().fill(Theme.stroke).frame(height: 1)
+                    dotaRules(profile)
+                }
             }
             .opacity(model.config.autoSwitch ? 1 : 0.5)
             .overlay(alignment: .topTrailing) {
@@ -230,15 +288,15 @@ struct ProfilesPage: View {
                 }
             }
 
-            quickSwitching
+            quickSwitching(profile.partial ? profile : nil)
 
             Button("Delete Profile") { delete(profile) }.buttonStyle(PillButtonStyle(kind: .danger))
         }
     }
 
-    /// The profiles this one could be based on: any that isn't itself, or based on it.
+    /// The profiles this one could be based on: any whole one that isn't itself, or based on it.
     private func bases(for profile: Profile) -> [String] {
-        model.config.profiles.map(\.name).filter { name in
+        model.config.profiles.filter { !$0.partial }.map(\.name).filter { name in
             name != profile.name && !model.config.chain(for: name).contains(profile.name)
         }
     }
@@ -266,7 +324,7 @@ struct ProfilesPage: View {
                 addAppMenu(profile)
             }
             if profile.apps.isEmpty {
-                Text("Add an app or a game, and this profile is in use whenever it is.")
+                Text("Add an app or a game, and this profile is \(profile.partial ? "on" : "in use") whenever it is.")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.tertiary)
             } else {
@@ -281,7 +339,16 @@ struct ProfilesPage: View {
                                     .foregroundStyle(Theme.good)
                             }
                             Spacer()
-                            IconButton(symbol: "xmark", help: "Remove") { model.updateProfile(profile.name) { $0.apps.removeAll { $0 == bundleID } } }
+                            IconButton(symbol: "xmark", help: "Remove") {
+                                model.updateProfile(profile.name) {
+                                    $0.apps.removeAll { $0 == bundleID }
+                                    // What was asked of the game goes with it.
+                                    if bundleID == DotaWatcher.bundleID {
+                                        $0.heroes = []
+                                        $0.dota = nil
+                                    }
+                                }
+                            }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -296,10 +363,16 @@ struct ProfilesPage: View {
                     Spacer(minLength: 0)
                 }
                 Text(profile.whileRunning
-                     ? "In use from the moment it starts until it quits, also while you are in another app."
-                     : "In use only while it is the app you are in; switch to another app and the profile steps aside.")
+                     ? "\(profile.partial ? "On" : "In use") from the moment it starts until it quits, also while you are in another app."
+                     : "\(profile.partial ? "On" : "In use") only while it is the app you are in; switch to another app and the profile steps aside.")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.dota.found && !profile.apps.contains(DotaWatcher.bundleID) {
+                Text("Add Dota 2, and it can be narrowed to a match, to the menus, or to the heroes you choose.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -351,21 +424,32 @@ struct ProfilesPage: View {
         .fixedSize()
     }
 
-    // MARK: Dota 2 heroes
+    // MARK: Dota 2
 
-    private func heroRules(_ profile: Profile) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Dota 2 heroes").font(.system(size: 13, weight: .medium))
-                Spacer()
-                addHeroMenu(profile)
+    /// What more is asked of Dota 2, once it is among the apps: a match or the menus, and heroes.
+    private func dotaRules(_ profile: Profile) -> some View {
+        let inUse = profile.partial ? "On" : "In use"
+        let explanation: String
+        switch profile.dota {
+        case nil: explanation = "\(inUse) in a match and in the menus alike."
+        case .playing?: explanation = "\(inUse) only while a match is being played — not in the game's menus, where the keys are for typing."
+        case .menu?: explanation = "\(inUse) only in the game's menus, not while a match is being played."
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("In Dota 2").font(.system(size: 13, weight: .medium))
+            HStack(spacing: 10) {
+                Segmented(options: [(DotaActivity?.none, "Any time"), (.playing, "During a match"), (.menu, "In the menus")],
+                          selection: Binding(get: { profile.dota }, set: { new in model.updateProfile(profile.name) { $0.dota = new } }))
+                    .frame(width: 400)
+                Spacer(minLength: 0)
             }
-            if profile.heroes.isEmpty {
-                Text("Add heroes, and this profile is in use while you are playing one of them. It comes before a profile for Dota 2 itself.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Theme.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
+            Text(explanation)
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Heroes").font(.system(size: 13, weight: .medium)).padding(.top, 4)
+            if !profile.heroes.isEmpty {
                 FlowLayout(spacing: 6) {
                     ForEach(profile.heroes, id: \.self) { hero in
                         HStack(spacing: 5) {
@@ -381,34 +465,92 @@ struct ProfilesPage: View {
                     }
                 }
             }
-            if !profile.heroes.isEmpty || model.dota.installed { DotaPanel(model: model) }
+            HeroSearch(taken: profile.heroes, playing: model.dota.hero) { hero in
+                model.updateProfile(profile.name) { if !$0.heroes.contains(hero) { $0.heroes.append(hero) } }
+            }
+            Text(profile.heroes.isEmpty
+                 ? "Whichever hero you play. Add heroes, and it is only while you are playing one of them."
+                 : "Only while you are playing \(profile.heroes.count == 1 ? "this hero" : "one of these heroes").")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !profile.heroes.isEmpty || profile.dota != nil || model.dota.installed { DotaPanel(model: model) }
         }
     }
+}
 
-    private func addHeroMenu(_ profile: Profile) -> some View {
-        let available = DotaHeroes.all.filter { !profile.heroes.contains($0.name) }
-        func add(_ hero: String) { model.updateProfile(profile.name) { $0.heroes.append(hero) } }
-        // A hundred and some heroes: by first letter, a handful of letters at a time.
-        let ranges: [ClosedRange<Character>] = ["A"..."C", "D"..."K", "L"..."N", "O"..."R", "S"..."S", "T"..."Z"]
-        return Menu {
-            if let hero = model.dota.hero, !profile.heroes.contains(hero) {
-                Button("\(DotaHeroes.title(hero)) — playing now") { add(hero) }
-                Divider()
+/// Adds heroes by name: type a few letters, and press Return for the first match or click one.
+private struct HeroSearch: View {
+    /// Heroes the profile has already.
+    let taken: [String]
+    /// The hero being played right now, offered before anything is typed.
+    let playing: String?
+    let onAdd: (String) -> Void
+
+    @State private var query = ""
+    @FocusState private var focused: Bool
+
+    private var matches: [(name: String, title: String)] {
+        Array(DotaHeroes.search(query).filter { !taken.contains($0.name) }.prefix(10))
+    }
+
+    private func add(_ name: String) {
+        onAdd(name)
+        query = ""
+        focused = true
+    }
+
+    var body: some View {
+        let matches = matches
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass").font(.system(size: 11, weight: .semibold)).foregroundStyle(Theme.tertiary)
+                TextField("Add a hero: type its name", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .focused($focused)
+                    .onSubmit { if let first = matches.first { add(first.name) } }
             }
-            ForEach(ranges, id: \.lowerBound) { range in
-                Menu(range.lowerBound == range.upperBound ? String(range.lowerBound) : "\(range.lowerBound) – \(range.upperBound)") {
-                    ForEach(available.filter { range.contains($0.title.first ?? " ") }, id: \.name) { hero in
-                        Button(hero.title) { add(hero.name) }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.black.opacity(0.28)))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(focused ? Theme.accent.opacity(0.7) : Theme.stroke))
+            .frame(maxWidth: 320)
+            if !matches.isEmpty {
+                FlowLayout(spacing: 6) {
+                    ForEach(Array(matches.enumerated()), id: \.element.name) { index, hero in
+                        Button { add(hero.name) } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "plus").font(.system(size: 8, weight: .bold))
+                                Text(hero.title).font(.system(size: 12, weight: .medium))
+                                if index == 0 { Image(systemName: "return").font(.system(size: 8, weight: .bold)).foregroundStyle(Theme.secondary) }
+                            }
+                            .foregroundStyle(Theme.text)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(Color.white.opacity(index == 0 ? 0.16 : 0.08)))
+                            .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
+            } else if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                Text("No hero by that name.").font(.system(size: 11.5)).foregroundStyle(Theme.tertiary)
+            } else if let playing, !taken.contains(playing) {
+                Button { add(playing) } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus").font(.system(size: 8, weight: .bold))
+                        Text("\(DotaHeroes.title(playing)) — playing now").font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(Theme.good.opacity(0.25)))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
             }
-        } label: {
-            AddLabel()
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize()
     }
 }
 
@@ -423,6 +565,11 @@ private struct DotaPanel: View {
         if !status.installed { return ("Hero detection is not set up yet.", Theme.warning) }
         if let error = status.error { return ("Can't listen for the game on port \(status.port.map(String.init) ?? "?"): \(error)", Theme.danger) }
         if let hero = status.hero { return ("Playing \(DotaHeroes.title(hero)).", Theme.good) }
+        switch status.activity {
+        case .playing?: return ("In a match. The hero shows once you have picked one.", Theme.good)
+        case .menu?: return ("Dota 2 is in its menus.", Theme.good)
+        case nil: break
+        }
         if status.receiving { return ("Connected to the game. The hero shows once you have picked one.", Theme.good) }
         if status.running { return ("Dota 2 is running but not reporting.", Theme.warning) }
         return ("Ready. Waiting for Dota 2 to start.", Theme.secondary)
@@ -446,13 +593,13 @@ private struct DotaPanel: View {
                 Text(error).font(.system(size: 11.5)).foregroundStyle(Theme.danger).fixedSize(horizontal: false, vertical: true)
             }
             if status.found && !status.installed {
-                Text("Dota 2 can tell other programs what is happening in your match — Valve's own Game State Integration, the one stream overlays use. Set Up adds a small settings file to the game that makes it tell RZMacro, on this Mac only, which hero you are playing. Nothing else is asked for, and nothing leaves the Mac.")
+                Text("Dota 2 can tell other programs what is happening in your match — Valve's own Game State Integration, the one stream overlays use. Set Up adds a small settings file to the game that makes it tell RZMacro, on this Mac only, which hero you are playing and whether a match is on. Nothing else is used, and nothing leaves the Mac.")
                     .font(.system(size: 11.5))
                     .foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else if status.installed {
                 launchOption
-                if status.running && !status.receiving && status.error == nil {
+                if status.running && !status.receiving && status.activity == nil && status.error == nil {
                     Text("The game reads the settings file when it starts: quit and start Dota 2 once after setting this up.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.secondary)
@@ -517,6 +664,11 @@ private struct AddLabel: View {
     }
 }
 
+extension Profile {
+    /// The symbol for a partial profile, beside `square.stack.3d.up` for a whole one.
+    static let partialSymbol = "square.2.layers.3d.top.filled"
+}
+
 /// An app's icon, from its bundle identifier.
 struct BundleIcon: View {
     let bundleID: String
@@ -535,6 +687,7 @@ struct BundleIcon: View {
 private struct ProfileCard: View {
     let name: String
     let detail: String
+    var isPartial = false
     let isSelected: Bool
     let isActive: Bool
     let onSelect: () -> Void
@@ -548,9 +701,15 @@ private struct ProfileCard: View {
     var body: some View {
         HStack(spacing: 8) {
             Circle().fill(isActive ? Theme.good : Color.clear).frame(width: 7, height: 7)
-                .help(isActive ? "In use now" : "")
+                .help(isActive ? (isPartial ? "On now" : "In use now") : "")
             VStack(alignment: .leading, spacing: 4) {
-                Text(name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    if isPartial {
+                        Image(systemName: Profile.partialSymbol).font(.system(size: 9.5)).foregroundStyle(Theme.tertiary)
+                            .help("A partial profile: goes on top of whichever profile is in use")
+                    }
+                }
                 Text(detail)
                     .font(.system(size: 11))
                     .foregroundStyle(isSelected ? Theme.text.opacity(0.75) : Theme.tertiary)
@@ -559,7 +718,7 @@ private struct ProfileCard: View {
             Spacer(minLength: 0)
             if hovering, let onMove {
                 HStack(spacing: 0) {
-                    IconButton(symbol: "arrow.up", help: "Move up: wins over the profiles below when several want to switch on") { onMove(-1) }.disabled(!canMoveUp)
+                    IconButton(symbol: "arrow.up", help: isPartial ? "Move up: wins a button that a partial profile below changes too, where both are on for the same kind of reason" : "Move up: wins over the profiles below when several want to switch on") { onMove(-1) }.disabled(!canMoveUp)
                     IconButton(symbol: "arrow.down", help: "Move down") { onMove(1) }.disabled(!canMoveDown)
                     if let onDelete { IconButton(symbol: "trash", help: "Delete this profile", action: onDelete) }
                 }

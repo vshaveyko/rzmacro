@@ -30,12 +30,28 @@ struct SettingsPage: View {
                 }
 
                 group("Devices") {
-                    if model.devices.isEmpty {
+                    let razer = model.devices.filter(\.isRazer)
+                    if razer.isEmpty {
                         Text("No Razer devices found.").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
                     }
-                    ForEach(model.devices) { device in
+                    ForEach(razer) { device in
                         deviceRow(device)
-                        if device.id != model.devices.last?.id { separator }
+                        if device.id != razer.last?.id { separator }
+                    }
+                }
+
+                group("Other keyboards") {
+                    let rows = model.otherKeyboardRows
+                    Text("Keys can be changed on keyboards that aren't Razer's too: swapped, or made to run shortcuts and macros, with the same profiles. RZMacro reads which keys are pressed on such a keyboard only once it is switched on here. Lighting and macro keys remain the Razer devices' alone.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if rows.isEmpty {
+                        Text("No other keyboard is plugged in.").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
+                    }
+                    ForEach(rows) { row in
+                        separator
+                        otherKeyboardRow(row)
                     }
                 }
 
@@ -129,6 +145,40 @@ struct SettingsPage: View {
         }
     }
 
+    private func otherKeyboardRow(_ row: AppModel.OtherKeyboardRow) -> some View {
+        // Switched on, but macOS would not let it be opened (Input Monitoring, usually).
+        let broken = model.devices.first { !$0.isRazer && $0.usbID == row.id.description }?.interfaces.filter { !$0.ok } ?? []
+        return VStack(alignment: .leading, spacing: 8) {
+            otherKeyboardSwitch(row)
+            ForEach(broken) { interface in
+                Label("Could not be opened: \(interface.state)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.danger)
+            }
+        }
+    }
+
+    private func otherKeyboardSwitch(_ row: AppModel.OtherKeyboardRow) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: row.isBuiltIn ? "laptopcomputer" : "keyboard")
+                .font(.system(size: 14))
+                .foregroundStyle(row.isOn ? Theme.accent : Theme.secondary)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill((row.isOn ? Theme.accent : Theme.secondary).opacity(0.16)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.name).font(.system(size: 13, weight: .medium))
+                Text("\(row.isBuiltIn ? "Built in" : "USB \(row.id)") · \(row.isConnected ? (row.isOn ? "in use" : "left alone") : "not connected")")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+            Text("Use with RZMacro").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+            Toggle("", isOn: Binding(get: { row.isOn }, set: { model.setOtherKeyboard(row, on: $0) }))
+                .toggleStyle(.switch)
+                .labelsHidden()
+        }
+    }
+
     private func deviceRow(_ device: Daemon.DeviceSummary) -> some View {
         let broken = device.interfaces.filter { !$0.ok }
         return VStack(alignment: .leading, spacing: 8) {
@@ -140,7 +190,7 @@ struct SettingsPage: View {
                     .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.accent.opacity(0.16)))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(device.name).font(.system(size: 13, weight: .medium))
-                    Text("USB 1532:\(String(format: "%04x", device.productID)) · firmware \(device.firmware ?? "unknown")")
+                    Text("USB \(device.usbID) · firmware \(device.firmware ?? "unknown")")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.secondary)
                 }

@@ -2,6 +2,46 @@ import AppKit
 import ApplicationServices
 import IOKit.hid
 
+extension Config {
+    /// The profiles, partial or whole, that the rules ask for, and which rule, given the app in
+    /// front, the apps that are running, and what Dota 2 says: the hero being played, and
+    /// whether a match is on. A profile's rule is one of its apps being in front, or running if
+    /// it says so; for Dota it may ask for a match or the menus, and for certain heroes, too.
+    /// The most specific comes first — a hero, then a match or the menus, then an app in front,
+    /// then one merely running — and under the same kind of rule, the earlier in the list.
+    func matches(partial: Bool, front: String?, hero: String?, activity: DotaActivity?, running: () -> Set<String>) -> [Daemon.ActivePartial] {
+        guard autoSwitch else { return [] }
+        var runningApps: Set<String>?
+        func isRunning(_ app: String) -> Bool {
+            if runningApps == nil { runningApps = running() }
+            return runningApps?.contains(app) == true
+        }
+        var matches: [Daemon.ActivePartial] = []
+        for profile in profiles where profile.partial == partial {
+            var best: Daemon.ProfileReason?
+            for app in profile.apps {
+                guard app == front || (profile.whileRunning && isRunning(app)) else { continue }
+                var reason = app == front ? Daemon.ProfileReason.appInFront(app) : .appRunning(app)
+                if app == DotaWatcher.bundleID {
+                    if let wanted = profile.dota {
+                        guard activity == wanted else { continue }
+                        reason = .dota(wanted)
+                    }
+                    if !profile.heroes.isEmpty {
+                        guard let hero, profile.heroes.contains(hero) else { continue }
+                        reason = .hero(hero)
+                    }
+                }
+                if best.map({ reason.rank < $0.rank }) ?? true { best = reason }
+            }
+            if let best { matches.append(Daemon.ActivePartial(name: profile.name, reason: best)) }
+        }
+        return matches.enumerated()
+            .sorted { ($0.element.reason.rank, $0.offset) < ($1.element.reason.rank, $1.offset) }
+            .map(\.element)
+    }
+}
+
 final class Daemon {
     static let version = "0.3.0"
 
@@ -26,8 +66,9 @@ final class Daemon {
     var onButton: ((Trigger, Bool) -> Void)?
     /// `rzmacro show` / a second launch of the app.
     var onShowWindow: (() -> Void)?
-    /// The profile in force changed: its name and why, for a note on screen.
-    var onProfileChanged: ((_ name: String, _ reason: String) -> Void)?
+    /// The profile in force changed, or a partial one went on or off: its name, and what
+    /// happened and why, for a note on screen.
+    var onProfileChanged: ((_ name: String, _ detail: String) -> Void)?
     /// While set, the next ordinary key pressed on the keyboard goes here instead of doing
     /// anything (the window's "pick a key by pressing it").
     var onKeyPick: ((Trigger) -> Void)?
@@ -53,7 +94,7 @@ final class Daemon {
     /// Why a profile is the one in force.
     enum ProfileReason: Equatable {
         case chosen
-        case appInFront(String), appRunning(String), hero(String)
+        case appInFront(String), appRunning(String), hero(String), dota(DotaActivity)
 
         var text: String {
             switch self {
@@ -61,6 +102,27 @@ final class Daemon {
             case .appInFront(let bundleID): return "\(appDisplayName(bundleID)) is in front"
             case .appRunning(let bundleID): return "\(appDisplayName(bundleID)) is running"
             case .hero(let name): return "playing \(DotaHeroes.title(name))"
+            case .dota(.playing): return "in a Dota 2 match"
+            case .dota(.menu): return "in Dota 2's menus"
+            }
+        }
+
+        /// How specific the rule is: the lower, the more.
+        var rank: Int {
+            switch self {
+            case .hero: return 0
+            case .dota: return 1
+            case .appInFront: return 2
+            case .appRunning: return 3
+            case .chosen: return 4
+            }
+        }
+
+        /// Something the game did, rather than a window coming to the front.
+        var isGameNews: Bool {
+            switch self {
+            case .hero, .dota: return true
+            default: return false
             }
         }
     }
@@ -80,7 +142,27 @@ final class Daemon {
         get { UserDefaults.standard.string(forKey: "profile") }
         set { UserDefaults.standard.set(newValue, forKey: "profile") }
     }
-    /// Every assignment in force under the active profile.
+    /// A partial profile that is on, and why.
+    struct ActivePartial: Equatable {
+        let name: String
+        let reason: ProfileReason
+
+        var text: String { reason == .chosen ? "switched on by hand" : reason.text }
+    }
+
+    /// The partial profiles that are on, on top of the profile in force. The one that wins a
+    /// button several of them change comes first.
+    private(set) var activePartials: [ActivePartial] = []
+    /// Partial profiles switched on by hand, which stay on until switched off. Like
+    /// `chosenProfile`, where things were left.
+    private var partialsByHand: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "partials") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "partials") }
+    }
+    /// Partial profiles switched off by hand while a rule asks for them. That lasts until the
+    /// rule stops asking.
+    private var partialsOverruled = Set<String>()
+    /// Every assignment in force: the active profile's, and on top the partial profiles'.
     private var layer: [Trigger: Assignment] = [:]
     private var lastDotaStatus = DotaWatcher.Status()
     /// Key-downs we swallowed; the matching key-up must go too.
@@ -192,7 +274,7 @@ final class Daemon {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
         }
         tap.stop()
-        remapper.clear(products: keyboardProducts)
+        remapper.clear(keyboards: keyboardIDs)
         for device in devices.devices {
             guard let control = device.control, (try? control.deviceMode()) == DeviceMode.driver.rawValue else { continue }
             try? control.setDeviceMode(.normal)
@@ -258,8 +340,12 @@ final class Daemon {
         if dota.hero != nil && !DotaWatcher.isRunning { dota.gameQuit() }
         let dotaStatus = dota.status
         if dotaStatus != lastDotaStatus {
+            // A match that has gone quiet is over, which nothing but the clock says.
+            if dotaStatus.activity != lastDotaStatus.activity {
+                log("dota: \(dotaStatus.activity.map { ProfileReason.dota($0).text } ?? "what the game is doing can't be told")")
+            }
             lastDotaStatus = dotaStatus
-            onStateChanged?()
+            refreshProfile()
         }
         lighting.refresh()
         sniffers.removeAll { $0.isClosed }
@@ -289,6 +375,7 @@ final class Daemon {
             lighting.update(spec: config.lighting)
         }
         if previous.driverMode != config.driverMode { applyModes() }
+        devices.wanted = Set(config.keyboards.map(\.id))
         refreshProfile()
     }
 
@@ -321,7 +408,7 @@ final class Daemon {
     private func devicesChanged() {
         for device in devices.devices {
             let interfaces = device.interfaces.map { "if\($0.number) \($0.role) \(Self.describe($0))" }.joined(separator: "; ")
-            log("device: \(device.kind.rawValue) \(device.name) (\(String(format: "%04x", device.productID))) — \(interfaces)")
+            log("device: \(device.kind.rawValue) \(device.name) (\(device.id)) — \(interfaces)")
         }
         swallowed.removeAll()
         swallowedButtons.removeAll()
@@ -403,74 +490,87 @@ final class Daemon {
 
     // MARK: Profiles
 
-    /// The profile the rules ask for, and which rule. The most specific wins: a hero over the
-    /// game it is played in, the app in front over one that is merely running.
-    private func automaticMatch() -> (name: String, reason: ProfileReason)? {
-        guard config.autoSwitch else { return nil }
-        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        // A hero only counts while the game is what is being played, not behind a browser.
-        if let hero = dota.hero, front == DotaWatcher.bundleID, let profile = config.profiles.first(where: { $0.heroes.contains(hero) }) {
-            return (profile.name, .hero(hero))
-        }
-        if let front, let profile = config.profiles.first(where: { $0.apps.contains(front) }) {
-            return (profile.name, .appInFront(front))
-        }
-        let background = config.profiles.filter { $0.whileRunning && !$0.apps.isEmpty }
-        if !background.isEmpty {
-            let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-            for profile in background {
-                if let app = profile.apps.first(where: running.contains) { return (profile.name, .appRunning(app)) }
-            }
-        }
-        return nil
+    /// The profiles, partial or whole, that the rules ask for right now, and which rule.
+    private func automaticMatches(partial: Bool) -> [ActivePartial] {
+        config.matches(
+            partial: partial, front: NSWorkspace.shared.frontmostApplication?.bundleIdentifier, hero: dota.hero, activity: dota.activity,
+            running: { Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)) })
     }
 
-    /// Works out which profile is in force and puts its assignments into effect. Called
-    /// whenever anything it depends on may have changed; `byHand` when that was the user
-    /// switching profile.
+    /// Works out which profile is in force, and which partial ones are on top of it, and puts
+    /// their assignments into effect. Called whenever anything it depends on may have changed;
+    /// `byHand` when that was the user switching profile.
     private func refreshProfile(byHand: Bool = false) {
-        let match = automaticMatch()
+        // Of the whole profiles the rules ask for, the first is the one.
+        let match = automaticMatches(partial: false).first
         if match?.name != automaticProfile { isOverruled = false }
         automaticProfile = match?.name
 
         var reason = isOverruled ? ProfileReason.chosen : (match?.reason ?? .chosen)
-        // By its name as the config has it; a profile that has since been deleted is no profile.
+        // By its name as the config has it; a profile that has since been deleted, or made a
+        // partial one, is no profile.
         let wanted = isOverruled ? overrulingProfile : (match?.name ?? chosenProfile)
-        let name = wanted.flatMap { config.profile(named: $0)?.name }
+        let name = wanted.flatMap { config.profile(named: $0) }.flatMap { $0.partial ? nil : $0.name }
         if name == nil { reason = .chosen }
 
+        // The partial ones go on top of it, whichever it is: those switched on by hand above
+        // those the rules ask for.
+        let asked = automaticMatches(partial: true)
+        partialsOverruled.formIntersection(asked.map(\.name))
+        let byHandNames = partialsByHand
+        var partials = config.profiles.filter { $0.partial && byHandNames.contains($0.name) }.map { ActivePartial(name: $0.name, reason: .chosen) }
+        partials += asked.filter { ask in !partialsOverruled.contains(ask.name) && !partials.contains { $0.name == ask.name } }
+
         let changed = name != activeProfile
-        func isHero(_ reason: ProfileReason) -> Bool { if case .hero = reason { return true } else { return false } }
+        let came = partials.filter { new in !activePartials.contains { $0.name == new.name } }
+        let went = activePartials.filter { old in !partials.contains { $0.name == old.name } }
         // A hero's profile coming on, or going off when the match ends, is news. So is a switch
         // by hand, which otherwise happens blind.
-        let isNews = byHand || isHero(reason) || isHero(profileReason)
+        let isNews = byHand || reason.isGameNews || profileReason.isGameNews
+        let partialNews = byHand || (came + went).contains { $0.reason.isGameNews }
         activeProfile = name
         profileReason = reason
-        layer = config.layer(for: name)
+        activePartials = partials
+        layer = config.layer(for: name, under: partials.map(\.name))
         applyKeyRemap()
         updateTap()
-        if changed {
-            log("profile: \(name ?? Profile.defaultName) (\(reason.text))")
-            if config.profileNotes == .always || (config.profileNotes == .notApps && isNews) {
-                onProfileChanged?(name ?? Profile.defaultName, reason.text)
-            }
+        if changed { log("profile: \(name ?? Profile.defaultName) (\(reason.text))") }
+        for partial in came { log("partial profile on: \(partial.name) (\(partial.text))") }
+        for partial in went { log("partial profile off: \(partial.name)") }
+        func shows(_ isNews: Bool) -> Bool { config.profileNotes == .always || (config.profileNotes == .notApps && isNews) }
+        if changed && shows(isNews) {
+            let with = partials.isEmpty ? "" : " · with \(partials.map(\.name).joined(separator: ", "))"
+            onProfileChanged?(name ?? Profile.defaultName, "Profile · \(reason.text)\(with)")
+        } else if let first = came.first, shows(partialNews) {
+            onProfileChanged?(came.map(\.name).joined(separator: " + "), "Partial profile on · \(first.text)")
+        } else if !went.isEmpty && shows(partialNews) {
+            onProfileChanged?(went.map(\.name).joined(separator: " + "), "Partial profile off")
         }
         onStateChanged?()
     }
 
     private var profileLine: String {
-        "profile: \(activeProfile ?? Profile.defaultName) (\(profileReason.text))"
+        (["profile: \(activeProfile ?? Profile.defaultName) (\(profileReason.text))"] + activePartials.map { "\($0.name) (\($0.text))" })
+            .joined(separator: " + ")
+    }
+
+    /// The profile that decides what a button does right now: a partial one that is on and
+    /// changes it, else the one in force.
+    private func decider(of trigger: Trigger) -> String {
+        activePartials.first { config.bindings(of: $0.name)[trigger] != nil }?.name ?? activeProfile ?? Profile.defaultName
     }
 
     /// Switches profile by hand: a profile's name, "default", "next", "previous", or "auto" to
-    /// hand the choice back to the rules. Returns a line saying where that leaves things.
+    /// hand the choice back to the rules. A partial profile's name switches it on, or off if
+    /// it is on. Returns a line saying where that leaves things.
     @discardableResult
     func switchProfile(_ word: String) -> String {
-        let names: [String?] = [nil] + config.profiles.map { Optional($0.name) }
+        let names: [String?] = [nil] + config.profiles.filter { !$0.partial }.map { Optional($0.name) }
         let target: String?
         switch word.lowercased() {
         case "auto":
             isOverruled = false
+            partialsOverruled.removeAll()
             refreshProfile(byHand: true)
             return profileLine
         case "next", "previous":
@@ -481,6 +581,17 @@ final class Daemon {
             target = nil
         default:
             guard let profile = config.profile(named: word) else { return "there is no profile named \"\(word)\"" }
+            if profile.partial {
+                if activePartials.contains(where: { $0.name == profile.name }) {
+                    partialsByHand.removeAll { $0 == profile.name }
+                    // Where a rule asks for it, that overrules the rule (see `refreshProfile`).
+                    partialsOverruled.insert(profile.name)
+                } else if partialsOverruled.remove(profile.name) == nil {
+                    partialsByHand.append(profile.name)
+                }
+                refreshProfile(byHand: true)
+                return profileLine
+            }
             target = profile.name
         }
         if automaticProfile != nil {
@@ -494,26 +605,36 @@ final class Daemon {
         return profileLine
     }
 
-    /// A profile was renamed in the window: follow it, where it is the one chosen by hand.
+    /// A profile is about to be renamed in the window: follow it, where it is one chosen by
+    /// hand. The configuration that has the new name comes next (`updateConfig`).
     func profileRenamed(from old: String, to new: String) {
         if chosenProfile == old { chosenProfile = new }
         if overrulingProfile == old { overrulingProfile = new }
-        refreshProfile()
+        if partialsByHand.contains(old) { partialsByHand = partialsByHand.map { $0 == old ? new : $0 } }
+        if partialsOverruled.remove(old) != nil { partialsOverruled.insert(new) }
+        activePartials = activePartials.map { $0.name == old ? ActivePartial(name: new, reason: $0.reason) : $0 }
+        if activeProfile == old { activeProfile = new }
+        if automaticProfile == old { automaticProfile = new }
     }
 
     private func profilesText() -> String {
         var lines = [profileLine + (isOverruled ? " — the rules ask for \(automaticProfile ?? Profile.defaultName); `rzmacro profile auto` goes back to them" : "")]
         if !config.autoSwitch { lines.append("automatic switching is off") }
         func line(_ name: String?, _ detail: String) -> String {
-            "\(name == activeProfile ? "*" : " ") \(name ?? Profile.defaultName)\(detail.isEmpty ? "" : "  — \(detail)")"
+            // "*" is the profile in use, "+" a partial one that is on.
+            let mark = name == activeProfile ? "*" : (activePartials.contains { $0.name == name } ? "+" : " ")
+            return "\(mark) \(name ?? Profile.defaultName)\(detail.isEmpty ? "" : "  — \(detail)")"
         }
         lines.append(line(nil, "\(config.bindings.count) assignments"))
         for profile in config.profiles {
-            var rules: [String] = []
+            var rules: [String] = profile.partial ? ["partial"] : []
             if !profile.apps.isEmpty { rules.append("\(profile.whileRunning ? "while running" : "in front"): \(profile.apps.map(appDisplayName).joined(separator: ", "))") }
-            if !profile.heroes.isEmpty { rules.append("heroes: \(profile.heroes.map(DotaHeroes.title).joined(separator: ", "))") }
-            if let base = profile.basedOn, base != Profile.defaultName { rules.append("based on \(base)") }
-            if profile.basedOn == nil { rules.append("stands alone") }
+            if let dota = profile.dota { rules.append("only \(ProfileReason.dota(dota).text)") }
+            if !profile.heroes.isEmpty { rules.append("only playing \(profile.heroes.map(DotaHeroes.title).joined(separator: ", "))") }
+            if !profile.partial {
+                if let base = profile.basedOn, base != Profile.defaultName { rules.append("based on \(base)") }
+                if profile.basedOn == nil { rules.append("stands alone") }
+            }
             lines.append(line(profile.name, (["\(profile.bindings.count) assignments"] + rules).joined(separator: "; ")))
         }
         return lines.joined(separator: "\n")
@@ -521,8 +642,8 @@ final class Daemon {
 
     // MARK: Keyboard keys
 
-    private var keyboardProducts: Set<Int> {
-        Set(devices.devices.filter { $0.kind == .keyboard }.map(\.productID))
+    private var keyboardIDs: Set<DeviceID> {
+        Set(devices.devices.filter { $0.kind == .keyboard }.map(\.id))
     }
 
     /// Tells the keyboard driver what the profile makes of the keyboard's ordinary keys: a key
@@ -540,7 +661,7 @@ final class Daemon {
             }
         }
         let before = remapper.status
-        remapper.apply(map, products: keyboardProducts)
+        remapper.apply(map, keyboards: keyboardIDs)
         if remapper.status != before { log("keyboard keys: \(remapper.status)") }
     }
 
@@ -573,6 +694,7 @@ final class Daemon {
         } else {
             parts.append(status.running ? "game running but not reporting" : "game not running")
         }
+        if status.running { parts.append(status.activity.map { ProfileReason.dota($0).text } ?? "can't tell match from menus (restart the game)") }
         switch DotaWatcher.hasLaunchOption() {
         case true?: break
         case false?: parts.append("launch option \(DotaWatcher.launchOption) is MISSING")
@@ -607,7 +729,7 @@ final class Daemon {
             if !sniffers.isEmpty {
                 let name = trigger.displayName == trigger.description ? "" : "  (\(trigger.displayName))"
                 // On the way down, what it is about to run, and under which profile.
-                let runs = pressed ? lookup(trigger).map { "  → \($0.summary) [\(activeProfile ?? Profile.defaultName)]" } ?? "" : ""
+                let runs = pressed ? lookup(trigger).map { "  → \($0.summary) [\(decider(of: trigger))]" } ?? "" : ""
                 broadcast("event   \(trigger) \(pressed ? "down" : "up")\(name)\(runs)")
             }
         }
@@ -677,7 +799,7 @@ final class Daemon {
 
     /// In driver mode the keyboard stops handling Fn combinations and sends the plain F-key.
     private var fnLayerActive: Bool {
-        devices.devices.contains { $0.kind == .keyboard && wantedMode(.keyboard) == .driver }
+        devices.devices.contains { $0.isRazer && $0.kind == .keyboard && wantedMode(.keyboard) == .driver }
     }
 
     private var fnHeld: Bool {
@@ -794,7 +916,8 @@ final class Daemon {
     /// log — and what you type on the keyboard only to `rzmacro sniff all`.
     private func sniff(_ device: RazerDevice, _ interface: HIDInterface, _ bytes: [UInt8]) {
         guard !sniffers.isEmpty else { return }
-        let isTyping = device.kind == .keyboard && interface.isKeyboard && (interface.maxInput <= 8 || bytes[0] == 1)
+        // All that another make's keyboard reports is typing.
+        let isTyping = device.kind == .keyboard && interface.isKeyboard && (!device.isRazer || interface.maxInput <= 8 || bytes[0] == 1)
         var shown = bytes
         if interface.isMouse && device.kind == .mouse {
             // Only the button byte; movement and wheel would drown everything else.
@@ -819,6 +942,10 @@ final class Daemon {
         let kind: DeviceKind
         let name: String
         let productID: Int
+        /// "1532:0293".
+        let usbID: String
+        /// A Razer device — rather than another make's keyboard, of which only the keys are ours.
+        let isRazer: Bool
         let firmware: String?
         let inDriverMode: Bool
         /// Names of the keys the device reports down with nothing holding them.
@@ -829,8 +956,8 @@ final class Daemon {
     var deviceSummaries: [DeviceSummary] {
         devices.devices.map { device in
             DeviceSummary(
-                id: "\(device.productID)-\(device.locationID)", kind: device.kind, name: device.name,
-                productID: device.productID, firmware: device.firmware,
+                id: "\(device.id)-\(device.locationID)", kind: device.kind, name: device.name,
+                productID: device.productID, usbID: device.id.description, isRazer: device.isRazer, firmware: device.firmware,
                 inDriverMode: wantedMode(device.kind) == .driver && device.lastModeError == nil && device.control != nil,
                 stuckKeys: Self.stuckKeyNames(device),
                 interfaces: device.interfaces.map {
@@ -838,6 +965,9 @@ final class Daemon {
                 })
         }
     }
+
+    /// Keyboards plugged in that are not Razer's, looked after or not.
+    var otherKeyboards: [DeviceManager.OtherKeyboardSeen] { devices.otherKeyboards }
 
     var isTapRunning: Bool { tap.isRunning }
     var lightingStatus: String { lighting.status }
@@ -880,7 +1010,11 @@ final class Daemon {
             } else {
                 mode = "no control channel"
             }
-            lines.append("  \(device.kind.rawValue): \(device.name) (1532:\(String(format: "%04x", device.productID)))  fw \(device.firmware ?? "?")  \(mode)")
+            if device.isRazer {
+                lines.append("  \(device.kind.rawValue): \(device.name) (\(device.id))  fw \(device.firmware ?? "?")  \(mode)")
+            } else {
+                lines.append("  keyboard: \(device.name) (\(device.id))  not Razer's: its keys only")
+            }
             for interface in device.interfaces {
                 lines.append("      if\(interface.number) \(interface.role): \(Self.describe(interface))")
             }
@@ -894,6 +1028,11 @@ final class Daemon {
                 }
             }
             if let stuck = Self.stuckText(device) { lines.append("      STUCK KEYS: \(stuck)") }
+        }
+        let unused = devices.otherKeyboards.filter { !devices.wanted.contains($0.id) }
+        if !unused.isEmpty {
+            lines.append("other keyboards, left alone (Settings turns them on, or `keyboards: [{ id: \"…\" }]` in the config):")
+            for keyboard in unused { lines.append("  \(keyboard.name) (\(keyboard.id))\(keyboard.isBuiltIn ? "  built in" : "")") }
         }
         return lines.joined(separator: "\n")
     }

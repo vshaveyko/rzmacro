@@ -10,8 +10,12 @@ enum PageRenderer {
     /// `profile=<name>` a profile (underscores for spaces), `photos=on|off` chooses photo or
     /// drawing, `config=<file>` shows that configuration instead of the real one (display
     /// only). For `render` alone, since it has no driver to ask: `active=<profile>` says which
-    /// profile is in use, `hero=<name>` which Dota hero is being played, and `stuck=<key>+<key>`
-    /// connects the page's device with those keys stuck down.
+    /// profile is in use, `on=<partial>+<partial>` which partial profiles are on,
+    /// `hero=<name>` which Dota hero is being played, `dota=playing|menu` what the game is
+    /// doing without one, and `stuck=<key>+<key>`
+    /// connects the page's device with those keys stuck down. `keyboard=<name>` (a layout
+    /// after a colon: `Keychron_K2:75%`) plugs in a keyboard that is not Razer's and puts it
+    /// into use.
     /// Returns the page, or nil if there is no such page.
     static func apply(_ description: String, to model: AppModel) -> Page? {
         let parts = description.split(separator: ",").map(String.init)
@@ -29,15 +33,36 @@ enum PageRenderer {
             case "active":
                 model.activeProfile = name == Profile.defaultName ? nil : name
                 model.profileReason = "chosen by hand"
+            case "on":
+                model.activePartials = name.split(separator: "+").map { Daemon.ActivePartial(name: String($0), reason: .chosen) }
             case "hero":
-                model.dota = DotaWatcher.Status(found: true, installed: true, port: 35570, running: true, receiving: true, hero: pair[1])
+                model.dota = DotaWatcher.Status(found: true, installed: true, port: 35570, running: true, receiving: true, hero: pair[1], activity: .playing)
                 model.dotaLaunchOption = true
                 if model.activeProfile != nil { model.profileReason = "playing \(DotaHeroes.title(pair[1]))" }
+                // A partial profile for that hero is on because of him.
+                model.activePartials = model.activePartials.map { partial in
+                    model.config.profile(named: partial.name)?.heroes.contains(pair[1]) == true ? Daemon.ActivePartial(name: partial.name, reason: .hero(pair[1])) : partial
+                }
+            case "dota":
+                model.dota = DotaWatcher.Status(found: true, installed: true, port: 35570, running: true, receiving: pair[1] == "playing", hero: nil, activity: DotaActivity(rawValue: pair[1]))
+                model.dotaLaunchOption = true
+            case "keyboard":
+                let words = name.split(separator: ":", maxSplits: 1).map(String.init)
+                let id = DeviceID(vendor: 0x05ac, product: 0x024f)
+                let keyboard = OtherKeyboard(id: id, name: words[0], shape: words.count > 1 ? KeyboardShape(rawValue: words[1]) : nil)
+                var config = model.config
+                config.keyboards = [keyboard]
+                model.preview(config)
+                model.otherKeyboards = [DeviceManager.OtherKeyboardSeen(id: id, name: keyboard.name, isBuiltIn: false)]
+                model.devices.append(Daemon.DeviceSummary(
+                    id: "render-other", kind: .keyboard, name: keyboard.name, productID: id.product, usbID: id.description, isRazer: false,
+                    firmware: nil, inDriverMode: false, stuckKeys: [], interfaces: []))
             case "stuck":
                 guard let kind = DeviceKind(rawValue: page.rawValue), let known = DeviceProfile.known.first(where: { $0.kind == kind }),
                       let productID = known.productID else { break }
                 model.devices = [Daemon.DeviceSummary(
-                    id: "render", kind: kind, name: kind == .keyboard ? "Razer keyboard" : "Razer mouse", productID: productID, firmware: "1.0", inDriverMode: true,
+                    id: "render", kind: kind, name: kind == .keyboard ? "Razer keyboard" : "Razer mouse", productID: productID,
+                    usbID: DeviceID(vendor: DeviceManager.razerVendorID, product: productID).description, isRazer: true, firmware: "1.0", inDriverMode: true,
                     stuckKeys: pair[1].split(separator: "+").map(String.init), interfaces: [])]
             default: break
             }

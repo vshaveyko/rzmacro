@@ -84,7 +84,7 @@ struct DevicePage: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     header
-                    if model.config.driverMode[kind] != true { driverModeWarning }
+                    if model.config.driverMode[kind] != true && device?.isRazer != false { driverModeWarning }
                     if let stuck = device?.stuckKeys, !stuck.isEmpty { stuckKeysWarning(stuck) }
                     deviceMap
                     Text(footnote)
@@ -104,7 +104,7 @@ struct DevicePage: View {
                 } else {
                     VStack(spacing: 8) {
                         Image(systemName: "hand.tap").font(.system(size: 26)).foregroundStyle(Theme.tertiary)
-                        Text("Press a button on the device").foregroundStyle(Theme.secondary)
+                        Text(kind == .keyboard && device?.isRazer == false ? "Click a key in the drawing" : "Press a button on the device").foregroundStyle(Theme.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -125,8 +125,14 @@ struct DevicePage: View {
                 HStack(spacing: 6) {
                     if let device {
                         StatusChip(text: "Connected", color: Theme.good, dot: true)
-                        if let firmware = device.firmware { StatusChip(text: "Firmware \(firmware)") }
-                        StatusChip(text: device.inDriverMode ? "Driver mode" : "Normal mode", color: device.inDriverMode ? Theme.secondary : Theme.warning)
+                        if device.isRazer {
+                            if let firmware = device.firmware { StatusChip(text: "Firmware \(firmware)") }
+                            StatusChip(text: device.inDriverMode ? "Driver mode" : "Normal mode", color: device.inDriverMode ? Theme.secondary : Theme.warning)
+                        } else {
+                            StatusChip(text: "Keys only")
+                                .help("Not a Razer device: its keys can be changed, like a Razer keyboard's. Lighting and macro keys are the Razer devices' alone.")
+                        }
+                        deviceSwitch
                     } else {
                         StatusChip(text: "Not connected", color: Theme.tertiary, dot: true)
                     }
@@ -140,11 +146,50 @@ struct DevicePage: View {
         }
     }
 
+    /// Which of several connected keyboards (or mice) the page shows. They share their
+    /// assignments; what differs is the drawing.
+    @ViewBuilder private var deviceSwitch: some View {
+        let all = model.devices(of: kind)
+        if all.count > 1 {
+            Menu {
+                ForEach(all) { other in
+                    Button {
+                        model.shownDevice[kind] = other.id
+                    } label: {
+                        if other.id == device?.id { Label(other.name, systemImage: "checkmark") } else { Text(other.name) }
+                    }
+                }
+            } label: {
+                StatusChip(text: "\(all.count) connected ▾")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Show another \(kind == .keyboard ? "keyboard" : "mouse"). Assignments apply to all of them.")
+        }
+    }
+
     /// Whether what is being edited is what the buttons are doing right now.
     @ViewBuilder private var profileNote: some View {
-        if !model.config.profiles.isEmpty {
+        if let partial = model.editing, model.isPartial(partial) {
+            if let reason = model.partialReason(partial) {
+                StatusChip(text: "On now", color: Theme.good, dot: true)
+                    .help("\(partial) is on (\(reason)), on top of \(model.activeProfile ?? Profile.defaultName). The dimmed buttons are that profile's.")
+            } else {
+                StatusChip(text: "Off now", color: Theme.tertiary, dot: true)
+                    .help("What you change here applies while \(partial) is on, on top of whichever profile is in use. The dimmed buttons are those of \(model.activeProfile ?? Profile.defaultName), in use now.")
+            }
+        } else if !model.config.profiles.isEmpty {
             if model.editing == model.activeProfile {
-                StatusChip(text: "In use now", color: Theme.good, dot: true)
+                HStack(spacing: 6) {
+                    if !model.activePartials.isEmpty {
+                        let names = model.activePartials.map(\.name).joined(separator: ", ")
+                        StatusChip(text: "+ \(names)", color: Theme.good)
+                            .help("On too, on top of this profile: \(names). The buttons a partial profile changes do what it says for as long as it is on.")
+                    }
+                    StatusChip(text: "In use now", color: Theme.good, dot: true)
+                }
             } else {
                 StatusChip(text: "In use now: \(model.activeProfile ?? Profile.defaultName)", color: Theme.tertiary, dot: true)
                     .help("The buttons are doing what the \(model.activeProfile ?? Profile.defaultName) profile says (\(model.profileReason)). What you change here applies when \(model.editing ?? Profile.defaultName) is in use.")
@@ -159,8 +204,13 @@ struct DevicePage: View {
         } else {
             tips.append("Tip: press a button on the device to jump straight to it. Buttons light up here while they are held.")
         }
-        if kind == .keyboard {
+        if kind == .keyboard, device?.isRazer == false {
+            tips = ["Any key can be changed — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it. If the drawing is not your keyboard's layout, choose another in its corner; a key it doesn't show can still be picked by pressing it."]
+        } else if kind == .keyboard {
             tips.append("Any ordinary key can be changed too — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it.")
+        }
+        if model.devices(of: kind).count > 1 {
+            tips.append("Assignments apply to every \(kind == .keyboard ? "keyboard" : "mouse") RZMacro looks after.")
         }
         return tips.joined(separator: " ")
     }
@@ -275,27 +325,62 @@ struct DevicePage: View {
             .overlay(alignment: .bottomTrailing) { pictureSwitch }
         } else {
             DeviceSchematic(
-                kind: kind, keys: keys, gridColumns: deviceProfile.listColumns ?? 3, lighting: model.config.lighting,
-                remapped: remappedKeys,
+                // Lit by the effect only if the effect is ours to give: not another make's keyboard.
+                kind: kind, keys: keys, gridColumns: deviceProfile.listColumns ?? 3, lighting: device?.isRazer == false ? nil : model.config.lighting,
+                remapped: remappedKeys, shape: model.shape(of: device), appleModifiers: device?.isRazer == false,
                 selected: selected, pressed: model.pressed, hovered: model.hoveredButton,
                 summary: summary, isAssigned: isAssigned,
                 onHover: { model.hoveredButton = $0 },
                 onSelect: { model.selectedButton[kind] = $0 })
             .padding(kind == .keyboard ? 22 : 18)
             // Room under a keyboard's keys for the switch in the corner: they are all clickable.
-            .padding(.bottom, kind == .keyboard && deviceProfile.picture != nil ? 26 : 0)
+            .padding(.bottom, kind == .keyboard && (deviceProfile.picture != nil || device?.isRazer == false) ? 26 : 0)
             .frame(maxWidth: .infinity)
             .background(RadialGradient(colors: [Color(rgb: 0x2C3140), Color(rgb: 0x171A21)], center: .center, startRadius: 0, endRadius: 360))
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.stroke))
             .overlay(alignment: .bottomTrailing) { pictureSwitch }
+            .overlay(alignment: .bottomTrailing) { layoutSwitch }
+        }
+    }
+
+    /// How much of a keyboard the drawing shows, for a keyboard whose model says nothing
+    /// about it: another make's.
+    @ViewBuilder private var layoutSwitch: some View {
+        if kind == .keyboard, let device, !device.isRazer {
+            let shape = model.shape(of: device)
+            Menu {
+                ForEach(KeyboardShape.allCases, id: \.self) { option in
+                    Button {
+                        model.setShape(option, of: device)
+                    } label: {
+                        if option == shape { Label(option.title, systemImage: "checkmark") } else { Text(option.title) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "keyboard").font(.system(size: 10, weight: .semibold))
+                    Text("Layout: \(shape.title)").font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(Theme.secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.black.opacity(0.45)))
+                .contentShape(Capsule())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .padding(10)
+            .help("Draw the keyboard as another size")
         }
     }
 
     /// What the keyboard's ordinary keys do in the profile being edited, by usage.
     private var remappedKeys: [UInt8: Assignment] {
         guard kind == .keyboard else { return [:] }
-        return model.config.layer(for: model.editing).reduce(into: [:]) { result, binding in
+        return model.shownLayer(for: model.editing).reduce(into: [:]) { result, binding in
             if binding.key.isOrdinaryKey, case .key(let usage) = binding.key.source { result[usage] = binding.value }
         }
     }
@@ -371,16 +456,17 @@ struct DevicePage: View {
                 Divider()
                 ForEach(model.config.profiles, id: \.name) { profile in
                     Button { model.editingProfile = profile.name } label: {
-                        Label(profile.name, systemImage: model.editing == profile.name ? "checkmark" : "square.stack.3d.up")
+                        Label(profile.name, systemImage: model.editing == profile.name ? "checkmark" : (profile.partial ? Profile.partialSymbol : "square.stack.3d.up"))
                     }
                 }
             }
             Divider()
             Button("New Profile") { model.addProfile() }
+            Button("New Partial Profile") { model.addProfile(partial: true) }
             Button("Manage Profiles…") { model.page = .profiles }
         } label: {
             HStack(spacing: 6) {
-                Image(systemName: model.editing == nil ? "square.grid.2x2.fill" : "square.stack.3d.up.fill").font(.system(size: 11))
+                Image(systemName: model.editing == nil ? "square.grid.2x2.fill" : (model.isPartial(model.editing!) ? Profile.partialSymbol : "square.stack.3d.up.fill")).font(.system(size: 11))
                 Text(model.editing ?? Profile.defaultName).font(.system(size: 12.5, weight: .medium))
                 Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.tertiary)
             }
@@ -394,7 +480,7 @@ struct DevicePage: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("The profile being edited. A profile changes only the buttons you change in it; the rest do what the profile it is based on says. When each profile is used is set on the Profiles page.")
+        .help("The profile being edited. A profile changes only the buttons you change in it; the rest do what the profile it is based on says — or, for a partial profile, whichever profile is in use. When each profile is used is set on the Profiles page.")
     }
 }
 

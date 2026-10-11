@@ -1,8 +1,11 @@
 import AppKit
 
 /// A named set of assignments that takes over from the default ones. It is switched to by
-/// hand, or by itself: while an app is in front, while a game is running, or while a certain
-/// Dota 2 hero is being played.
+/// hand, or by itself: while an app is in front or a game is running — and for Dota 2, if it
+/// says so, only during a match, only in the menus, or only while certain heroes are played.
+///
+/// A partial profile takes over nothing: it is switched on and off the same ways, and while
+/// on changes only its own buttons, on top of whichever profile is in use. Several can be on.
 struct Profile: Equatable {
     /// What the bindings outside any profile are called, in the app and in `basedOn`.
     static let defaultName = "Default"
@@ -11,6 +14,9 @@ struct Profile: Equatable {
 
     var name: String
     var bindings: [Trigger: Assignment] = [:]
+    /// Goes on top of the profile in use rather than being it. Its own `basedOn` then says
+    /// nothing: the buttons it leaves alone are that profile's, whichever it is at the time.
+    var partial = false
     /// Whose assignments apply to the buttons this profile leaves alone: another profile,
     /// "Default", or nil for nobody's — those buttons then do what they do out of the box.
     var basedOn: String? = Profile.defaultName
@@ -18,10 +24,19 @@ struct Profile: Equatable {
     var apps: [String] = []
     /// On for as long as one of `apps` is running, rather than only while it is in front.
     var whileRunning = false
-    /// Dota 2 heroes that switch it on, by internal name without the prefix ("invoker").
+    /// Asks more of Dota 2, where that is among `apps`: with heroes listed, that one of them is
+    /// being played. By internal name without the prefix ("invoker").
     var heroes: [String] = []
+    /// And likewise that a match is being played, or that the game is in its menus.
+    var dota: DotaActivity?
 
-    var isAutomatic: Bool { !apps.isEmpty || !heroes.isEmpty }
+    var isAutomatic: Bool { !apps.isEmpty }
+
+    /// Heroes and matches are Dota's: a profile that asks for them is one for the game.
+    mutating func tidyDotaRules() {
+        let isForDota = apps.contains(DotaWatcher.bundleID)
+        if !isForDota && (!heroes.isEmpty || dota != nil) { apps.append(DotaWatcher.bundleID) }
+    }
 }
 
 /// When a change of profile is worth a note on screen.
@@ -51,7 +66,8 @@ extension Config {
             // Based on a profile that is gone: as if it were based on the default ones.
             guard let profile = profile(named: name) else { break }
             chain.append(profile.name)
-            guard let base = profile.basedOn else { return chain }
+            // A partial profile is based on nothing of its own.
+            guard !profile.partial, let base = profile.basedOn else { return chain }
             current = base
         }
         chain.append(nil)
@@ -68,6 +84,14 @@ extension Config {
     func layer(for name: String?) -> [Trigger: Assignment] {
         chain(for: name).reversed().reduce(into: [:]) { layer, link in
             layer.merge(bindings(of: link)) { _, nearer in nearer }
+        }
+    }
+
+    /// Every assignment in force with a profile in use and partial profiles on top of it, the
+    /// one that wins a button several of them change first.
+    func layer(for name: String?, under partials: [String]) -> [Trigger: Assignment] {
+        partials.reversed().reduce(into: layer(for: name)) { layer, partial in
+            layer.merge(bindings(of: partial)) { _, upper in upper }
         }
     }
 

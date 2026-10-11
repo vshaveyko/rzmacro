@@ -14,7 +14,8 @@ extension Assignment {
 }
 
 /// Changes what a keyboard's ordinary keys are, in the keyboard driver itself — the mechanism
-/// behind `hidutil property --set UserKeyMapping`, applied to the Razer keyboards only.
+/// behind `hidutil property --set UserKeyMapping`, applied only to the keyboards RZMacro
+/// looks after.
 ///
 /// A key can become another key (Caps Lock into Escape), which then behaves like the real one
 /// everywhere: held, repeating, in games, in password fields. Or it can become nothing, which
@@ -41,34 +42,33 @@ final class KeyRemapper {
     /// The keyboards' services, as last looked up, and the client they belong to. Looking them
     /// up means asking every input service on the Mac what it is — a couple of hundred — so it
     /// is done when devices change, not every time the profile does.
-    private var found: (products: Set<Int>, client: IOHIDEventSystemClient, services: [IOHIDServiceClient])?
+    private var found: (keyboards: Set<DeviceID>, client: IOHIDEventSystemClient, services: [IOHIDServiceClient])?
     /// The mapping each service was last given, by its registry id. A service can't usefully
     /// be asked: setting a mapping lets go of whatever remapped keys are held, so it is set
     /// only on a service that hasn't been given this one — a keyboard just plugged in, say.
-    private var given: [UInt64: [UInt64: UInt64]] = [:]
+    private var given: [UInt64: (service: IOHIDServiceClient, map: [UInt64: UInt64])] = [:]
 
     /// Devices came or went: the services have to be looked up again.
     func devicesChanged() { found = nil }
 
-    /// The keyboard-typing services of the given Razer products.
-    private func services(products: Set<Int>) -> [IOHIDServiceClient] {
-        guard !products.isEmpty else { return [] }
-        if let found, found.products == products { return found.services }
+    /// The keyboard-typing services of the given models.
+    private func services(keyboards: Set<DeviceID>) -> [IOHIDServiceClient] {
+        guard !keyboards.isEmpty else { return [] }
+        if let found, found.keyboards == keyboards { return found.services }
         let client = IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault)
         let all = IOHIDEventSystemClientCopyServices(client) as? [IOHIDServiceClient] ?? []
         let services = all.filter { service in
-            func number(_ key: String) -> Int? { (IOHIDServiceClientCopyProperty(service, key as CFString) as? NSNumber)?.intValue }
-            return number(kIOHIDVendorIDKey) == DeviceManager.razerVendorID
-                && products.contains(number(kIOHIDProductIDKey) ?? -1)
+            func number(_ key: String) -> Int { (IOHIDServiceClientCopyProperty(service, key as CFString) as? NSNumber)?.intValue ?? 0 }
+            return keyboards.contains(DeviceID(vendor: number(kIOHIDVendorIDKey), product: number(kIOHIDProductIDKey)))
                 && IOHIDServiceClientConformsTo(service, UInt32(kHIDPage_GenericDesktop), UInt32(kHIDUsage_GD_Keyboard)) != 0
         }
-        found = (products, client, services)
+        found = (keyboards, client, services)
         return services
     }
 
-    /// Makes `map` — keyboard usage to what it becomes — the mapping of every keyboard among
-    /// `products`.
-    func apply(_ map: [UInt8: UInt64], products: Set<Int>) {
+    /// Makes `map` — keyboard usage to what it becomes — the mapping of every one of
+    /// `keyboards`, and takes ours off any keyboard that is no longer among them.
+    func apply(_ map: [UInt8: UInt64], keyboards: Set<DeviceID>) {
         let wanted = Dictionary(uniqueKeysWithValues: map.map { (UInt64(kHIDPage_KeyboardOrKeypad) << 32 | UInt64($0.key), $0.value) })
         // Nothing to map and nothing of ours left behind: leave the keyboards as they are,
         // including any mapping the user made with hidutil.
@@ -79,15 +79,20 @@ final class KeyRemapper {
         let pairs = wanted.map {
             [kIOHIDKeyboardModifierMappingSrcKey: NSNumber(value: $0.key), kIOHIDKeyboardModifierMappingDstKey: NSNumber(value: $0.value)]
         }
-        let services = services(products: products)
+        let services = services(keyboards: keyboards)
         var ids = Set<UInt64>(), refused = 0
         for service in services {
             let id = (IOHIDServiceClientGetRegistryID(service) as? NSNumber)?.uint64Value ?? 0
             ids.insert(id)
-            guard given[id] != wanted else { continue }
-            if IOHIDServiceClientSetProperty(service, Self.property, pairs as CFArray) { given[id] = wanted } else { refused += 1 }
+            guard given[id]?.map != wanted else { continue }
+            if IOHIDServiceClientSetProperty(service, Self.property, pairs as CFArray) { given[id] = (service, wanted) } else { refused += 1 }
         }
-        given = given.filter { ids.contains($0.key) }
+        // A keyboard we have stopped looking after gets its keys back. (One that has been
+        // unplugged took the mapping with it; telling it so fails and does not matter.)
+        for (id, last) in given where !ids.contains(id) {
+            if !last.map.isEmpty { IOHIDServiceClientSetProperty(last.service, Self.property, [] as CFArray) }
+            given[id] = nil
+        }
         // With no keyboard to ask, what a crash may have left on one is still unknown.
         if !services.isEmpty { applied = !wanted.isEmpty }
 
@@ -104,7 +109,7 @@ final class KeyRemapper {
     }
 
     /// Hands every keyboard back unmapped.
-    func clear(products: Set<Int>) {
-        apply([:], products: products)
+    func clear(keyboards: Set<DeviceID>) {
+        apply([:], keyboards: keyboards)
     }
 }

@@ -20,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         buildMainMenu()
         buildStatusItem()
         daemon.onShowWindow = { [weak self] in self?.showWindow() }
-        daemon.onProfileChanged = { [weak self] name, reason in self?.profileNote.show(name, reason) }
+        daemon.onProfileChanged = { [weak self] name, detail in self?.profileNote.show(name, detail) }
         daemon.onSnapshot = { [weak self] page, path, done in self?.snapshot(page: page, path: path, done: done) }
 
         // Opened by hand: show the window. Started at login: stay out of the way in the menu bar.
@@ -141,12 +141,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !profiles.isEmpty {
             menu.addItem(.separator())
             menu.addItem(.sectionHeader(title: "Profile"))
-            for name in [nil] + profiles.map({ Optional($0.name) }) {
+            for name in [nil] + profiles.filter({ !$0.partial }).map({ Optional($0.name) }) {
                 let item = NSMenuItem(title: name ?? Profile.defaultName, action: #selector(useProfileFromMenu(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = name
                 item.state = daemon.activeProfile == name ? .on : .off
                 menu.addItem(item)
+            }
+            let partials = profiles.filter(\.partial)
+            if !partials.isEmpty {
+                // On top of that one: each is switched on and off by itself.
+                menu.addItem(.separator())
+                menu.addItem(.sectionHeader(title: "Partial Profiles"))
+                for profile in partials {
+                    let item = NSMenuItem(title: profile.name, action: #selector(useProfileFromMenu(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = profile.name
+                    item.state = daemon.activePartials.contains { $0.name == profile.name } ? .on : .off
+                    menu.addItem(item)
+                }
             }
             menu.addItem(.separator())
             if daemon.isOverruled {
@@ -207,8 +220,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 }
 
-/// A note at the top of the screen, gone after a moment: which profile just came on. It takes
-/// no clicks and no focus, and shows over a game in full screen.
+/// A note at the top of the screen, gone after a moment: which profile just came on, or which
+/// partial one went on or off. It takes no clicks and no focus, and shows over a game in full
+/// screen.
 final class ProfileNote {
     private var panel: NSPanel?
     private var hiding: DispatchWorkItem?
@@ -226,11 +240,11 @@ final class ProfileNote {
         return panel
     }
 
-    func show(_ name: String, _ reason: String) {
+    func show(_ name: String, _ detail: String) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let panel = self.panel ?? makePanel()
         self.panel = panel
-        let view = NSHostingView(rootView: ProfileNoteView(name: name, reason: reason))
+        let view = NSHostingView(rootView: ProfileNoteView(name: name, detail: detail))
         let size = view.fittingSize
         panel.contentView = view
         let area = screen.visibleFrame
@@ -255,7 +269,7 @@ final class ProfileNote {
 
 private struct ProfileNoteView: View {
     let name: String
-    let reason: String
+    let detail: String
 
     var body: some View {
         HStack(spacing: 12) {
@@ -264,7 +278,7 @@ private struct ProfileNoteView: View {
                 .foregroundStyle(Theme.accent)
             VStack(alignment: .leading, spacing: 2) {
                 Text(name).font(.system(size: 17, weight: .bold)).foregroundStyle(Theme.text)
-                Text("Profile · \(reason)").font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
+                Text(detail).font(.system(size: 11.5)).foregroundStyle(Theme.secondary)
             }
         }
         .padding(.horizontal, 20)

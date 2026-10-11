@@ -5,9 +5,12 @@ import Foundation
 struct Config: Equatable {
     /// Whether to switch each device kind into Razer driver mode while the driver runs.
     var driverMode: [DeviceKind: Bool] = [.keyboard: true, .mouse: true]
+    /// Keyboards that are not Razer's, to look after as well: only the ones listed here.
+    var keyboards: [OtherKeyboard] = []
     /// What buttons do when no profile says otherwise: the "Default" profile.
     var bindings: [Trigger: Assignment] = [:]
-    /// Named sets of assignments. Where several ask to be switched on at once, the earlier wins.
+    /// Named sets of assignments. Where several ask to be switched on at once, the earlier wins;
+    /// partial ones are all on together, and there the earlier wins a button two of them change.
     var profiles: [Profile] = []
     /// Whether apps, games and Dota heroes may switch profiles by themselves.
     var autoSwitch = true
@@ -62,6 +65,13 @@ struct Config: Equatable {
                         config.driverMode[kind] = flag
                     }
                 }
+            case "keyboards":
+                guard let keyboards = value as? [Any] else { throw ConfigError("keyboards: expected a list [ { id: \"05ac:024f\" }, … ]") }
+                for (index, entry) in keyboards.enumerated() {
+                    let keyboard = try parseKeyboard(entry, path: "keyboards[\(index)]")
+                    // Listed twice is listed once.
+                    if !config.keyboards.contains(where: { $0.id == keyboard.id }) { config.keyboards.append(keyboard) }
+                }
             case "bindings":
                 config.bindings = try parseBindings(value, path: "bindings")
             case "profiles":
@@ -101,7 +111,7 @@ struct Config: Equatable {
                 guard let options = value as? [String: Any] else { throw ConfigError("lighting: expected an object") }
                 do { config.lighting = try LightSpec(config: options) } catch { throw ConfigError("lighting: \(error)") }
             default:
-                throw ConfigError("unknown top-level key \"\(key)\" (expected devices, bindings, profiles, macros, keyDelay, lighting, autoSwitch, profileNotes)")
+                throw ConfigError("unknown top-level key \"\(key)\" (expected devices, keyboards, bindings, profiles, macros, keyDelay, lighting, autoSwitch, profileNotes)")
             }
         }
 
@@ -118,8 +128,13 @@ struct Config: Equatable {
             if config.profiles.prefix(index).contains(where: { $0.name.caseInsensitiveCompare(profile.name) == .orderedSame }) {
                 throw ConfigError("profiles[\(index)]: there is already a profile named \"\(profile.name)\"")
             }
-            if let base = profile.basedOn, base != Profile.defaultName, config.profile(named: base) == nil {
-                throw ConfigError("profiles[\(index)].basedOn: there is no profile named \"\(base)\"")
+            if let base = profile.basedOn, base != Profile.defaultName {
+                guard let based = config.profile(named: base) else {
+                    throw ConfigError("profiles[\(index)].basedOn: there is no profile named \"\(base)\"")
+                }
+                if based.partial {
+                    throw ConfigError("profiles[\(index)].basedOn: \"\(based.name)\" is a partial profile, and nothing can be based on one")
+                }
             }
         }
         return config
@@ -154,6 +169,9 @@ struct Config: Equatable {
                 } else {
                     throw ConfigError("\(path).basedOn: expected a profile's name, \"Default\" or null")
                 }
+            case "partial":
+                guard let flag = value as? Bool else { throw ConfigError("\(path).partial: expected true or false") }
+                profile.partial = flag
             case "apps":
                 profile.apps = try strings(value, option)
             case "whileRunning":
@@ -161,9 +179,19 @@ struct Config: Equatable {
                 profile.whileRunning = flag
             case "heroes":
                 profile.heroes = try strings(value, option).map(DotaHeroes.name(matching:))
+            case "dota":
+                guard let activity = (value as? String).flatMap(DotaActivity.init(rawValue:)) else {
+                    throw ConfigError("\(path).dota: expected \"playing\" (during a match) or \"menu\"")
+                }
+                profile.dota = activity
             default:
-                throw ConfigError("\(path): unknown option \"\(option)\" (expected name, bindings, basedOn, apps, whileRunning, heroes)")
+                throw ConfigError("\(path): unknown option \"\(option)\" (expected name, bindings, partial, basedOn, apps, whileRunning, heroes, dota)")
             }
+        }
+        // `heroes` used to be a rule of its own; it is the game's, as is `dota`.
+        profile.tidyDotaRules()
+        if profile.partial && object["basedOn"] != nil {
+            throw ConfigError("\(path).basedOn: a partial profile goes on top of whichever profile is in use — it is not based on one")
         }
         return profile
     }
@@ -273,6 +301,27 @@ struct Config: Equatable {
         }
     }
 
+    /// `"05ac:024f"`, or `{ id: "05ac:024f", name: "Keychron K2", layout: "75%" }`.
+    private static func parseKeyboard(_ value: Any, path: String) throws -> OtherKeyboard {
+        let object = value as? [String: Any] ?? (value as? String).map { ["id": $0] }
+        guard let object else { throw ConfigError("\(path): expected { id: \"vendor:product\" }") }
+        guard let id = (object["id"] as? String).flatMap(DeviceID.init) else {
+            throw ConfigError("\(path).id: expected the keyboard's USB ids in hex, like \"05ac:024f\" (`rzmacro status` lists them)")
+        }
+        guard id.vendor != DeviceManager.razerVendorID else { throw ConfigError("\(path): Razer devices are looked after already") }
+        var keyboard = OtherKeyboard(id: id, name: object["name"] as? String ?? "Keyboard \(id)")
+        if let layout = object["layout"] {
+            guard let shape = (layout as? String).flatMap(KeyboardShape.init(rawValue:)) else {
+                throw ConfigError("\(path).layout: expected one of \(KeyboardShape.allCases.map(\.rawValue).joined(separator: ", "))")
+            }
+            keyboard.shape = shape
+        }
+        if let extra = object.keys.first(where: { !["id", "name", "layout"].contains($0) }) {
+            throw ConfigError("\(path): unknown option \"\(extra)\" (expected id, name, layout)")
+        }
+        return keyboard
+    }
+
     // MARK: Writing
 
     var jsonObject: [String: Any] {
@@ -283,13 +332,21 @@ struct Config: Equatable {
             "devices": Dictionary(uniqueKeysWithValues: DeviceKind.allCases.map { ($0.rawValue, ["driverMode": driverMode[$0] ?? false]) }),
             "bindings": bindingsObject(bindings),
         ]
+        if !keyboards.isEmpty {
+            object["keyboards"] = keyboards.map { ["id": $0.id.description, "name": $0.name, "layout": $0.shape.rawValue] }
+        }
         if !profiles.isEmpty {
             object["profiles"] = profiles.map { profile -> [String: Any] in
                 var object: [String: Any] = ["name": profile.name, "bindings": bindingsObject(profile.bindings)]
-                if profile.basedOn != Profile.defaultName { object["basedOn"] = profile.basedOn ?? NSNull() }
+                if profile.partial {
+                    object["partial"] = true
+                } else if profile.basedOn != Profile.defaultName {
+                    object["basedOn"] = profile.basedOn ?? NSNull()
+                }
                 if !profile.apps.isEmpty { object["apps"] = profile.apps }
                 if profile.whileRunning { object["whileRunning"] = true }
                 if !profile.heroes.isEmpty { object["heroes"] = profile.heroes }
+                if let dota = profile.dota { object["dota"] = dota.rawValue }
                 return object
             }
         }

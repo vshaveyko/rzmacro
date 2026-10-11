@@ -129,10 +129,23 @@ struct AssignmentInspector: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
-                if let profile, assignment == nil, let inherited = model.effective(key.trigger, profile: profile) {
+                if let profile, assignment == nil, model.isPartial(profile) {
+                    // A partial profile is based on nothing of its own: what shows is the profile in use.
+                    let now = model.effective(key.trigger, profile: profile).map { "\($0.assignment.summary), from \($0.from ?? Profile.defaultName)" }
+                    Label("\(profile) leaves this button to whichever profile is in use\(now.map { " — right now: \($0)" } ?? ""). Choose an action to change it while \(profile) is on.", systemImage: "arrow.turn.down.right")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let profile, assignment == nil, let inherited = model.effective(key.trigger, profile: profile) {
                     Label("In \(profile) this button does what \(inherited.from ?? Profile.defaultName) says (\(inherited.assignment.summary)). Choose an action to change it here.", systemImage: "arrow.turn.down.right")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let over = model.partialOver(key.trigger, profile: profile) {
+                    Label("Right now this button does what \(over.name) says (\(over.assignment.summary)): that partial profile is on, on top of this one.", systemImage: Profile.partialSymbol)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.warning)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -214,6 +227,12 @@ struct AssignmentInspector: View {
                         update { $0.steps = [new] }
                     }
                     if kind == .profile {
+                        if case .profile(let name) = step, model.isPartial(name) {
+                            Text("\(name) is a partial profile: one press switches it on, the next off.")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(Theme.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         Text("Profiles are made, and told when to switch on by themselves, on the Profiles page.")
                             .font(.system(size: 11.5))
                             .foregroundStyle(Theme.tertiary)

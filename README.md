@@ -28,9 +28,15 @@ window to configure them in.
 - **Remap ordinary keys too.** Caps Lock into Escape, Alt and Win swapped, a key that runs a
   macro. A plain key-for-key swap is done by the keyboard driver itself, so it works
   everywhere, games and password fields included.
+- **Other makes of keyboard, for their keys.** Switch one on in Settings and its keys can be
+  remapped and given macros like a Razer keyboard's, with the same profiles. (Lighting and
+  macro keys are for Razer devices only.)
 - **Profiles.** Named sets of assignments, one built on another. Switch between them from the
-  menu bar or with a button — or let them switch themselves: while an app is in front, while
-  a game is running, or while you are playing a certain **Dota 2 hero**.
+  menu bar or with a button — or let them switch themselves: while an app is in front or a
+  game is running, and in **Dota 2** only during a match, only in the menus, or only while
+  you are playing certain heroes.
+- **Partial profiles.** A few buttons changed under the same conditions, on top of whichever
+  profile is in use — and still on top when that profile changes.
 - **Lighting in sync.** Off, static, breathing, spectrum or wave, rendered from one clock and
   streamed to every device, so keyboard and mouse never drift apart.
 - **Lives in the menu bar**, and everything is also in a plain config file and a small
@@ -83,14 +89,15 @@ macOS asks you to allow two things, in **System Settings → Privacy & Security*
 - **Accessibility** — to send the keystrokes your macros contain, and to swallow the keystroke
   a mouse button would otherwise type when you have given that button something else to do.
 
-What it does with them: it opens only USB devices with Razer's vendor id, and looks at keyboard
-events only to decide whether one came from a bound mouse button (or is an Fn combination the
-keyboard has handed over). Of the Razer keyboard's own keys it acts on the ones you have given
-something to do and ignores the rest. Nothing you type is stored or sent anywhere.
+What it does with them: it opens only USB devices with Razer's vendor id, and other keyboards
+that you have switched on yourself in Settings (the rest it knows by name only). It looks at
+keyboard events only to decide whether one came from a bound mouse button (or is an Fn
+combination the keyboard has handed over). Of a keyboard's own keys it acts on the ones you
+have given something to do and ignores the rest. Nothing you type is stored or sent anywhere.
 
 The app makes no network connections, with two exceptions that happen only if you ask: the
 **Photo** button on a device page downloads that model's product picture from razer.com, and
-setting up [Dota 2 hero detection](#dota-2-heroes) makes it listen on this Mac's own loopback
+setting up [Dota 2 hero detection](#dota-2) makes it listen on this Mac's own loopback
 address (`127.0.0.1`) for the game to report to. To know which profile applies it also looks
 at which app is in front and which are running — their identifiers, nothing else.
 
@@ -103,12 +110,35 @@ at which app is in front and which are running — their identifiers, nothing el
 - **Ordinary keys.** Every key in the keyboard drawing can be clicked and given an action
   (*Pick a Key* selects one by pressing it). Give it a single key and leave *Hold down* on,
   and it simply is that key — Caps Lock is Escape. Give it anything else and it works like a
-  macro key. Only the Razer keyboard is affected, not the Mac's own.
+  macro key. Only the Razer keyboard is affected, not the Mac's own — unless you switch
+  another keyboard on (below).
+- **Shortcuts for a game.** A key or button that should be a combination in a game — W as
+  Alt+W — wants *Hold down*: the keys go down when you press and come up when you let go, as
+  if you held them yourself. *Run once* presses and releases them within a few milliseconds,
+  and a game that looks at its keys once a frame can miss the modifier and see a plain W.
+  (*Settings → Key presses* slows *Run once* down, for when it has to be a tap.) What a game
+  calls Alt is the Mac's Option key, ⌥ — see [Good to know](#good-to-know) if the recorder
+  shows ⌘ instead.
+- **Other keyboards.** *Settings → Other keyboards* lists every keyboard that is plugged in
+  and not Razer's, the Mac's own included, each with a switch. One that is switched on gets
+  the Keyboard page too: the same assignments apply to it, and its drawing can be set to its
+  size (full, tenkeyless, 75%, 65%, 60%) from the corner of the picture. With more than one
+  keyboard in use, the chip beside the name chooses which is shown.
 - **Profiles.** Make profiles, say what each is based on, and say when it switches on by
-  itself: add apps or games (while in front, or for as long as they run) and Dota 2 heroes.
+  itself: add apps or games (while in front, or for as long as they run). With Dota 2 among
+  them, the profile can be narrowed to a match, to the menus, and to heroes — type a few
+  letters of a hero's name and press Return.
   Higher in the list wins when several apply. To switch by hand use the menu-bar icon, or give
   a button the *Profile* action — next, previous, or a particular one. A profile chosen by
   hand while a game's profile is on lasts until you leave the game.
+- **Partial profiles.** A profile set to *Partial profile* does not take over: while it is on
+  — for its apps, games and heroes, or switched on by hand — the buttons assigned in it do
+  what it says, and every other button goes on doing what the profile in use says, whichever
+  that is and however often it changes. Several can be on at once; a button two of them change
+  goes to one switched on by hand, then to the more specific rule (hero, app in front, app
+  running), then to the one higher in the list. The menu-bar icon, or a button given the
+  *Profile* action, switches one on and off; switched off by hand while its app or hero has it
+  on, it stays off until that app or hero has gone and come back.
 - **Macros.** *Record* captures the keys you type (optionally with the pauses between them).
   Steps can be changed, reordered, duplicated and added by hand. A **Hold** step keeps a key
   down until you let go of the button, so "Press F4, Hold F4" is a double-tap-and-hold.
@@ -118,29 +148,44 @@ at which app is in front and which are running — their identifiers, nothing el
   dim and brighten everything together.
 - **Settings.** Permissions, connected devices, driver mode, key speed, start at login.
 
-## Dota 2 heroes
+## Dota 2
 
-A profile can switch on while you are playing a particular hero — one layout for Invoker,
-another for Meepo, on top of a general one for the game.
+A profile for Dota 2 can be narrowed to the heroes you choose — one layout for Invoker,
+another for Meepo, on top of a general one for the game — and to a match or to the menus:
+remapped keys during a match, plain ones in the menus, where they are for typing.
+
+![The Profiles page: a partial profile for Dota 2, on during a match while Earthshaker or Tiny is played](docs/profiles.png)
 
 RZMacro learns the hero from Dota itself, through Valve's Game State Integration: the
 interface stream overlays use, in which the game posts its state to addresses listed in
 settings files in its own folder. Nothing is read from the game's memory. To set it up:
 
-1. On the **Profiles** page add a hero to a profile and click **Set Up**. That writes one small
-   file, `gamestate_integration_rzmacro.cfg`, into Dota's `cfg/gamestate_integration` folder,
-   asking for the hero only and pointing at this Mac only. **Remove** deletes it again.
+1. On the **Profiles** page add Dota 2 to a profile's apps and click **Set Up**. That writes one
+   small file, `gamestate_integration_rzmacro.cfg`, into Dota's `cfg/gamestate_integration`
+   folder, asking for the hero and the player's own state and pointing at this Mac only.
+   **Remove** deletes it again.
 2. In Steam, right-click Dota 2 → Properties → General → Launch Options and add
    `-gamestateintegration`. The game ignores those files without it. The Profiles page says
    whether it is set.
 3. Restart Dota 2.
 
-A hero's profile applies while Dota is the app in front. Base it on your Dota profile and it
-only has to contain what is different for that hero.
+A profile with heroes is in use only while one of them is being played; one without is in use
+whichever hero you play. Base a hero's profile on your Dota profile and it only has to contain
+what is different for that hero. Or make it a partial profile, and those few buttons change
+for the hero on top of whichever profile you have in use.
+
+*During a match* is what the game itself reports as playing; *In the menus* is everything
+else while the game is running. The game is not heard from at all before the first match, and
+a match that stops reporting for 25 seconds counts as over. Nothing tells RZMacro that the
+chat line is open during a match: the game does not say.
 
 ## Other devices
 
-Only the two models above have been tested. Everything specific to a model lives in one table,
+**Keyboards that aren't Razer's** can be used for their keys: remapping, macros on keys,
+profiles. They are opened only if you switch them on (*Settings → Other keyboards*, or
+`keyboards` in the config file). Nothing else about them is touched — no lighting, no modes.
+
+Of Razer's own, only the two models above have been tested. Everything specific to a model lives in one table,
 [`Sources/rzmacro/DeviceProfiles.swift`](Sources/rzmacro/DeviceProfiles.swift): its special
 buttons and how its LEDs are addressed. Any other device with Razer's USB vendor id (`1532`)
 gets a generic profile:
@@ -194,6 +239,10 @@ written by hand (JSON with comments; comments are lost when the app next saves):
 {
   devices: { keyboard: { driverMode: true }, mouse: { driverMode: true } },
 
+  // Keyboards of other makes to look after as well, by USB id (`rzmacro status` lists the
+  // ones plugged in). `layout` is how the app draws it: full, tkl, 75%, 65% or 60%.
+  keyboards: [ { id: "05ac:024f", name: "Keychron K2", layout: "75%" } ],
+
   lighting: { effect: "wave", period: 6, brightness: 80 },
 
   // How keys are pressed, in ms held and ms paused per key; 0 (the default) is instant.
@@ -225,12 +274,17 @@ written by hand (JSON with comments; comments are lost when the app next saves):
   profiles: [
     { name: "Browsing", apps: ["com.apple.Safari"],             // while Safari is in front
       bindings: { "mouse.1": "cmd+t", "mouse.2": "cmd+w" } },
-    { name: "Dota", apps: ["com.valvesoftware.dota2"],
+    { name: "Dota", apps: ["com.valvesoftware.dota2"], dota: "playing",  // during a match only
       bindings: { "keyboard.left-cmd": [], "mouse.3": "f4" } }, // no Win key in the game
     { name: "Invoker", basedOn: "Dota", heroes: ["invoker"],    // while playing Invoker
       bindings: { "keyboard.capslock": { macro: "Copy to other app" } } },
     { name: "Recording", apps: ["com.obsproject.obs-studio"], whileRunning: true,
       bindings: { "keyboard.M1": "cmd+shift+r" } },             // even with OBS in the background
+    // Partial: on top of whichever profile is in use, rather than in its place.
+    { name: "Meepo keys", partial: true, heroes: ["meepo"],
+      bindings: { "mouse.4": "tab" } },
+    { name: "Numpad", partial: true,                            // on and off by hand:
+      bindings: { "mouse.1": "kp1", "mouse.2": "kp2" } },       //   { profile: "Numpad" }
   ],
 }
 ```
@@ -246,6 +300,9 @@ or one of `keys`, `text`, `shell`, `app`, `open`, `media`, `click`, `light`, `ma
 An ordinary key bound to one key with `hold: true` is swapped for it in the keyboard driver;
 with anything else it runs the action and stops typing its own character. Heroes are written
 the way the game or its players name them (`"invoker"`, `"Anti-Mage"`, `"npc_dota_hero_zuus"`).
+`heroes` and `dota: "playing" | "menu"` narrow a profile's rule for Dota 2 (and put the game
+among its `apps` if it is not there). A `partial: true` profile takes no `basedOn`, and
+nothing can be based on one.
 `autoSwitch: false` turns automatic switching off; `profileNotes: "always" | "except-apps" | "never"`
 says when a profile change is shown on screen. Older files' `apps: { "<bundle id>": { … } }`
 are still read, as one profile per app.
@@ -258,6 +315,7 @@ rzmacro light wave period=4         try an effect
 rzmacro press keyboard.M1 500       run a button's assignment as if held for 500 ms
 rzmacro profile                     the profiles, and which one is in use and why
 rzmacro profile next                switch by hand: a name, default, next, previous, auto
+rzmacro profile Numpad              a partial profile's name switches it on, or off again
 rzmacro dota                        hero detection: what it hears from the game
 rzmacro sniff                       show button events as you press them
 rzmacro keys                        key names usable in shortcuts
@@ -278,13 +336,22 @@ The log is at `~/Library/Logs/rzmacro.log`.
 - The left mouse button can't be reassigned, on purpose: losing it by accident would leave no
   way to click. A reassigned wheel direction applies to any wheel mouse that is plugged in
   (a turn of the wheel can't be traced to one device); trackpad scrolling is never affected.
-- Bindings are per kind of device (`keyboard.…`, `mouse.…`), so two mice share theirs.
+- Bindings are per kind of device (`keyboard.…`, `mouse.…`), so two mice share theirs, and
+  so do a Razer keyboard and any other keyboard you have switched on.
 - Key swaps live in the keyboard driver while RZMacro runs and are taken off when it quits. If
   it is ever killed outright, they stay until it is started again or the keyboard is
   replugged. Caps Lock can be remapped like any key; the Fn key can't, it never leaves the
   keyboard.
 - While a shortcut or macro is being recorded in the window, the keyboard's keys are
   themselves again, so what you press is what gets recorded.
+- A recorded shortcut has the modifiers the keyboard sends, whatever is printed on the keys.
+  On a keyboard in its Mac layout the key beside the space bar is Command (⌘) and the next
+  one out is Option (⌥); in a PC layout it is the other way round. Games read Option as Alt,
+  so if "Alt+W" was recorded as ⌘W, record it again with the other key, or write
+  `"alt+w"` in the config file.
+- Dota 2 says whether a match is being played and with which hero, and nothing more: not
+  that the chat line is open. A profile can leave the keys alone in the menus; during a
+  match, typing in chat goes through the remapped keys.
 - A device's mode is not changed while one of its buttons is down. A Naga X whose side button
   is held across the change goes on reporting that button's key as held — to macOS as well —
   until the mouse loses power, and the button stops responding. RZMacro waits for the buttons

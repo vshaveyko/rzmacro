@@ -98,7 +98,7 @@ private struct Sidebar: View {
             SidebarItem(
                 icon: "square.stack.3d.up.fill", title: "Profiles",
                 // Which one is in use, once there is more than the default to be in use.
-                detail: model.config.profiles.isEmpty ? nil : "In use: \(model.activeProfile ?? Profile.defaultName)",
+                detail: model.config.profiles.isEmpty ? nil : "In use: \(([model.activeProfile ?? Profile.defaultName] + model.activePartials.map(\.name)).joined(separator: " + "))",
                 trailing: model.config.profiles.isEmpty ? nil : "\(model.config.profiles.count)",
                 isSelected: model.page == .profiles
             ) { model.page = .profiles }

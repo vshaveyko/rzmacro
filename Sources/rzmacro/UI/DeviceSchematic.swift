@@ -12,6 +12,10 @@ struct DeviceSchematic: View {
     let lighting: LightSpec?
     /// What the keyboard's ordinary keys have been given to do, by usage.
     var remapped: [UInt8: Assignment] = [:]
+    /// How much of a keyboard to draw.
+    var shape = KeyboardShape.full
+    /// The bottom row as Apple has it — Control, Option, Command — rather than as Razer does.
+    var appleModifiers = false
     let selected: Trigger?
     let pressed: Set<Trigger>
     let hovered: Trigger?
@@ -35,8 +39,8 @@ struct DeviceSchematic: View {
         }
     }
 
-    static func aspectRatio(kind: DeviceKind) -> CGFloat {
-        kind == .keyboard ? KeyboardLayout.size.width / KeyboardLayout.size.height : MouseLayout.size.width / MouseLayout.size.height
+    static func aspectRatio(kind: DeviceKind, shape: KeyboardShape = .full) -> CGFloat {
+        kind == .keyboard ? KeyboardLayout.width(shape) / KeyboardLayout.height(shape) : MouseLayout.size.width / MouseLayout.size.height
     }
 
     var body: some View {
@@ -45,12 +49,12 @@ struct DeviceSchematic: View {
             let time = context.date.timeIntervalSince(LightingController.epoch)
             GeometryReader { geometry in
                 switch kind {
-                case .keyboard: keyboard(scale: geometry.size.width / KeyboardLayout.size.width, time: time)
+                case .keyboard: keyboard(scale: geometry.size.width / KeyboardLayout.width(shape), time: time)
                 case .mouse: mouse(scale: geometry.size.width / MouseLayout.size.width, time: time)
                 }
             }
         }
-        .aspectRatio(Self.aspectRatio(kind: kind), contentMode: .fit)
+        .aspectRatio(Self.aspectRatio(kind: kind, shape: shape), contentMode: .fit)
     }
 
     /// The colour an LED at `position` (0…1 across all devices) shows right now.
@@ -62,7 +66,7 @@ struct DeviceSchematic: View {
     // MARK: Keyboard
 
     private func keyboard(scale: CGFloat, time: Double) -> some View {
-        let layout = KeyboardLayout(macroKeys: macroKeys.count, hasRoller: !rollerKeys.isEmpty)
+        let layout = KeyboardLayout(shape: shape, macroKeys: macroKeys.count, hasRoller: !rollerKeys.isEmpty, appleModifiers: appleModifiers)
         let gap = 0.07 * scale
         func rect(_ unit: CGRect) -> CGRect {
             CGRect(x: unit.minX * scale, y: unit.minY * scale, width: unit.width * scale, height: unit.height * scale).insetBy(dx: gap, dy: gap)
@@ -78,7 +82,7 @@ struct DeviceSchematic: View {
                 context.drawLayer { layer in
                     layer.addFilter(.blur(radius: scale * 0.16))
                     for cap in layout.caps {
-                        let color = led(Double(cap.rect.midX / KeyboardLayout.size.width) * 0.8, time)
+                        let color = led(Double(cap.rect.midX / KeyboardLayout.width(shape)) * 0.8, time)
                         layer.fill(Path(roundedRect: rect(cap.rect).insetBy(dx: -gap, dy: -gap), cornerRadius: scale * 0.2), with: .color(color.opacity(0.75)))
                     }
                 }
@@ -130,7 +134,7 @@ struct DeviceSchematic: View {
                 button(key, unit: unit, scale: scale, led: led(0.75, time))
             }
             if let cap = layout.caps.first(where: { $0.trigger != nil && $0.trigger == hovered }), let usage = cap.usage {
-                callout(KeyboardKeys.byUsage[usage]?.title ?? cap.legend, remapped[usage]?.summary ?? "click to change", over: rect(cap.rect), width: KeyboardLayout.size.width * scale)
+                callout(KeyboardKeys.byUsage[usage]?.title ?? cap.legend, remapped[usage]?.summary ?? "click to change", over: rect(cap.rect), width: KeyboardLayout.width(shape) * scale)
             }
         }
     }
@@ -280,10 +284,27 @@ struct DeviceSchematic: View {
     }
 }
 
-/// Where everything on a full-size keyboard goes, in key units (one unit = one ordinary key).
+/// Where everything on a keyboard goes, in key units (one unit = one ordinary key).
 private struct KeyboardLayout {
-    /// Macro column, main block, navigation cluster, number pad; six rows with a gap under the top one.
-    static let size = CGSize(width: 24.6, height: 6.5)
+    /// How wide the drawing is. A full-size keyboard fills it — macro column, main block,
+    /// navigation cluster, number pad. A smaller one is drawn somewhat larger, with room
+    /// either side: filling the width too, its keys would be half as big again.
+    static func width(_ shape: KeyboardShape) -> CGFloat {
+        switch shape {
+        case .full: return 24.6
+        case .tenkeyless: return 21.5
+        case .compact75, .compact65, .compact60: return 19.5
+        }
+    }
+
+    static func height(_ shape: KeyboardShape) -> CGFloat {
+        switch shape {
+        // Six rows, with a gap under the top one.
+        case .full, .tenkeyless: return 6.5
+        case .compact75: return 6
+        case .compact65, .compact60: return 5
+        }
+    }
 
     struct Cap {
         let rect: CGRect
@@ -298,8 +319,24 @@ private struct KeyboardLayout {
     let macros: [CGRect]
     let roller: CGRect
 
-    init(macroKeys: Int, hasRoller: Bool) {
-        func rowY(_ row: Int) -> CGFloat { row == 0 ? 0 : 0.5 + CGFloat(row) }
+    init(shape: KeyboardShape, macroKeys: Int, hasRoller: Bool, appleModifiers: Bool) {
+        let isLarge = shape == .full || shape == .tenkeyless
+        let hasFunctionRow = isLarge || shape == .compact75
+        /// Rows are numbered from the function row, 0, whether or not there is one.
+        func rowY(_ row: Int) -> CGFloat {
+            if isLarge { return row == 0 ? 0 : 0.5 + CGFloat(row) }
+            return CGFloat(hasFunctionRow ? row : row - 1)
+        }
+        var keysWide: CGFloat
+        switch shape {
+        case .full: keysWide = 23
+        case .tenkeyless: keysWide = 18.5
+        case .compact75, .compact65: keysWide = 16
+        case .compact60: keysWide = 15
+        }
+        let macroColumn: CGFloat = macroKeys > 0 ? 1.6 : 0
+        let left = (Self.width(shape) - keysWide - macroColumn) / 2
+
         var caps: [Cap] = []
         /// Keys side by side, starting at `x`: each a name from `KeyboardKeys`, with "*1.5" for
         /// one that is wider than a unit. A name that is no key is drawn with that as its legend.
@@ -313,37 +350,68 @@ private struct KeyboardLayout {
                 x += width
             }
         }
-        let main: CGFloat = 1.6, nav = main + 15.5, pad = nav + 3.5
-        // Function row: Esc, then three groups of four.
-        run(["escape"], x: main, row: 0)
-        run(["f1", "f2", "f3", "f4"], x: main + 2, row: 0)
-        run(["f5", "f6", "f7", "f8"], x: main + 6.5, row: 0)
-        run(["f9", "f10", "f11", "f12"], x: main + 11, row: 0)
-        run(["grave", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equal", "delete*2"], x: main, row: 1)
-        run(["tab*1.5", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "leftbracket", "rightbracket", "backslash*1.5"], x: main, row: 2)
-        run(["capslock*1.75", "a", "s", "d", "f", "g", "h", "j", "k", "l", "semicolon", "quote", "return*2.25"], x: main, row: 3)
-        run(["left-shift*2.25", "z", "x", "c", "v", "b", "n", "m", "comma", "period", "slash", "right-shift*2.75"], x: main, row: 4)
-        run(["left-ctrl*1.25", "left-cmd*1.25", "left-alt*1.25", "space*6.25", "right-alt*1.25", "Fn*1.25", "menu*1.25", "right-ctrl*1.25"], x: main, row: 5)
-        // Navigation cluster and arrows.
-        run(["printscreen", "scrolllock", "pause"], x: nav, row: 0)
-        run(["insert", "home", "pageup"], x: nav, row: 1)
-        run(["forwarddelete", "end", "pagedown"], x: nav, row: 2)
-        run(["up"], x: nav + 1, row: 4)
-        run(["left", "down", "right"], x: nav, row: 5)
-        // Number pad; the roller, if there is one, takes the place of the keys above it.
-        if !hasRoller { run(["", "", "", ""], x: pad, row: 0) }
-        run(["numlock", "kp-divide", "kp-multiply", "kp-minus"], x: pad, row: 1)
-        run(["kp7", "kp8", "kp9"], x: pad, row: 2)
-        run(["kp-plus"], x: pad + 3, row: 2, height: 2)
-        run(["kp4", "kp5", "kp6"], x: pad, row: 3)
-        run(["kp1", "kp2", "kp3"], x: pad, row: 4)
-        run(["kp-enter"], x: pad + 3, row: 4, height: 2)
-        run(["kp0*2", "kp-dot"], x: pad, row: 5)
+        let main = left + macroColumn, nav = main + 15.5, pad = nav + 3.5
+        let digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equal", "delete*2"]
+        let letters = [
+            ["tab*1.5", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "leftbracket", "rightbracket", "backslash*1.5"],
+            ["capslock*1.75", "a", "s", "d", "f", "g", "h", "j", "k", "l", "semicolon", "quote", "return*2.25"],
+            ["left-shift*2.25", "z", "x", "c", "v", "b", "n", "m", "comma", "period", "slash"],
+        ]
+        let leftModifiers = appleModifiers ? ["left-ctrl*1.25", "left-alt*1.25", "left-cmd*1.25"] : ["left-ctrl*1.25", "left-cmd*1.25", "left-alt*1.25"]
+        // Without a function row, Escape is where the backtick would be.
+        run([hasFunctionRow ? "grave" : "escape"] + digits, x: main, row: 1)
+        run(letters[0], x: main, row: 2)
+        run(letters[1], x: main, row: 3)
+
+        if isLarge || shape == .compact60 {
+            if hasFunctionRow {
+                // Function row: Esc, then three groups of four.
+                run(["escape"], x: main, row: 0)
+                run(["f1", "f2", "f3", "f4"], x: main + 2, row: 0)
+                run(["f5", "f6", "f7", "f8"], x: main + 6.5, row: 0)
+                run(["f9", "f10", "f11", "f12"], x: main + 11, row: 0)
+            }
+            run(letters[2] + ["right-shift*2.75"], x: main, row: 4)
+            let rightModifiers = appleModifiers
+                ? ["right-cmd*1.25", "right-alt*1.25", "Fn*1.25", "right-ctrl*1.25"]
+                : ["right-alt*1.25", "Fn*1.25", "menu*1.25", "right-ctrl*1.25"]
+            run(leftModifiers + ["space*6.25"] + rightModifiers, x: main, row: 5)
+        } else {
+            // The compact ones: everything in one block, sixteen keys wide, with the arrows
+            // tucked into the corner and the navigation keys in a column down the right edge.
+            if hasFunctionRow {
+                // The last key of the row is the keyboard's own: its backlight, usually.
+                run(["escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "printscreen", "forwarddelete", "☼"], x: main, row: 0)
+            }
+            let column = hasFunctionRow ? ["pageup", "pagedown", "home", "end"] : ["forwarddelete", "pageup", "pagedown", "end"]
+            for (index, key) in column.enumerated() { run([key], x: main + 15, row: index + 1) }
+            run(letters[2] + ["right-shift*1.75", "up"], x: main, row: 4)
+            run(leftModifiers + ["space*6.25", appleModifiers ? "right-cmd" : "right-alt", "Fn", "right-ctrl", "left", "down", "right"], x: main, row: 5)
+        }
+        if isLarge {
+            // Navigation cluster and arrows.
+            run(["printscreen", "scrolllock", "pause"], x: nav, row: 0)
+            run(["insert", "home", "pageup"], x: nav, row: 1)
+            run(["forwarddelete", "end", "pagedown"], x: nav, row: 2)
+            run(["up"], x: nav + 1, row: 4)
+            run(["left", "down", "right"], x: nav, row: 5)
+        }
+        if shape == .full {
+            // Number pad; the roller, if there is one, takes the place of the keys above it.
+            if !hasRoller { run(["", "", "", ""], x: pad, row: 0) }
+            run(["numlock", "kp-divide", "kp-multiply", "kp-minus"], x: pad, row: 1)
+            run(["kp7", "kp8", "kp9"], x: pad, row: 2)
+            run(["kp-plus"], x: pad + 3, row: 2, height: 2)
+            run(["kp4", "kp5", "kp6"], x: pad, row: 3)
+            run(["kp1", "kp2", "kp3"], x: pad, row: 4)
+            run(["kp-enter"], x: pad + 3, row: 4, height: 2)
+            run(["kp0*2", "kp-dot"], x: pad, row: 5)
+        }
         self.caps = caps
 
         // Six macro keys run down the whole left edge; fewer sit beside the main rows.
         let firstRow = macroKeys >= 6 ? 0 : 1
-        macros = (0..<macroKeys).map { CGRect(x: 0, y: rowY(min(firstRow + $0, 5)), width: 1, height: 1) }
+        macros = (0..<macroKeys).map { CGRect(x: left, y: rowY(min(firstRow + $0, 5)), width: 1, height: 1) }
         roller = CGRect(x: pad + 0.5, y: 0.18, width: 3, height: 0.64)
     }
 }

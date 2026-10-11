@@ -188,8 +188,11 @@ final class HIDInterface {
     /// Asks to be told about every key on this interface going down or up. The values come from
     /// the system's own reading of the report descriptor, so it makes no difference whether
     /// the keyboard reports six keys at a time or all of them.
-    func watchKeys(_ handler: @escaping IOHIDValueCallback) {
-        guard openResult == kIOReturnSuccess, isKeyboard, maxInput > 0 else { return }
+    ///
+    /// `whatever` its main purpose: some keyboards report keys on a second interface as well,
+    /// one that calls itself a media-key device first.
+    func watchKeys(whateverItIs whatever: Bool = false, _ handler: @escaping IOHIDValueCallback) {
+        guard openResult == kIOReturnSuccess, isKeyboard || whatever, maxInput > 0 else { return }
         IOHIDDeviceSetInputValueMatching(device, [kIOHIDElementUsagePageKey: kHIDPage_KeyboardOrKeypad] as CFDictionary)
         IOHIDDeviceRegisterInputValueCallback(device, handler, Unmanaged.passUnretained(self).toOpaque())
         watchesKeys = true
@@ -256,8 +259,10 @@ final class HIDInterface {
     }
 }
 
-/// A physical Razer device: the set of HID interfaces sharing one USB location.
+/// A physical device being looked after: the set of HID interfaces sharing one USB location.
+/// A Razer keyboard or mouse — or somebody else's keyboard, of which only the keys are ours.
 final class RazerDevice {
+    let vendorID: Int
     let productID: Int
     let locationID: Int
     let name: String
@@ -273,13 +278,18 @@ final class RazerDevice {
     var rawDown = Set<UInt8>()
     var buttons: UInt8 = 0
 
-    init(productID: Int, locationID: Int, name: String) {
+    init(vendorID: Int, productID: Int, locationID: Int, name: String) {
+        self.vendorID = vendorID
         self.productID = productID
         self.locationID = locationID
         self.name = name
     }
 
+    var id: DeviceID { DeviceID(vendor: vendorID, product: productID) }
+    var isRazer: Bool { vendorID == DeviceManager.razerVendorID }
+
     var kind: DeviceKind {
+        guard isRazer else { return .keyboard }
         if let known = DeviceProfile.known.first(where: { $0.productID == productID }) { return known.kind }
         if let first = interfaces.first(where: { $0.number == 0 }) { return first.usbProtocol == 2 ? .mouse : .keyboard }
         return interfaces.contains(where: { $0.isMouse && !$0.isControl }) ? .mouse : .keyboard
@@ -332,8 +342,40 @@ final class DeviceManager {
     static let razerVendorID = 0x1532
 
     private let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    /// Watches for keyboards of any make. It is a second manager because one manager asked
+    /// for both hands over a Razer keyboard interface twice, as two different objects.
+    private let keyboards = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     private(set) var devices: [RazerDevice] = []
     private var settleTimer: Timer?
+    /// Every keyboard plugged in that is not Razer's, looked after or not.
+    private var others: [IOHIDDevice] = []
+
+    /// The keyboards that are not Razer's to look after as well. The rest are known to be
+    /// there, so that they can be offered, and are otherwise left alone: never opened.
+    var wanted = Set<DeviceID>() {
+        didSet { if wanted != oldValue { reconcile() } }
+    }
+
+    /// A keyboard that is plugged in and is not Razer's.
+    struct OtherKeyboardSeen: Equatable {
+        let id: DeviceID
+        let name: String
+        let isBuiltIn: Bool
+    }
+
+    var otherKeyboards: [OtherKeyboardSeen] {
+        others.reduce(into: []) { list, device in
+            let seen = Self.describe(device)
+            if !list.contains(where: { $0.id == seen.id }) { list.append(seen) }
+        }
+    }
+
+    private static func describe(_ device: IOHIDDevice) -> OtherKeyboardSeen {
+        func int(_ key: String) -> Int { (IOHIDDeviceGetProperty(device, key as CFString) as? NSNumber)?.intValue ?? 0 }
+        let id = DeviceID(vendor: int(kIOHIDVendorIDKey), product: int(kIOHIDProductIDKey))
+        let name = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String)?.trimmingCharacters(in: .whitespaces)
+        return OtherKeyboardSeen(id: id, name: name.flatMap { $0.isEmpty ? nil : $0 } ?? "Keyboard \(id)", isBuiltIn: int(kIOHIDBuiltInKey) != 0)
+    }
 
     var onEvent: ((RazerDevice, KeySource, Bool) -> Void)?
     var onReport: ((RazerDevice, HIDInterface, [UInt8]) -> Void)?
@@ -352,19 +394,44 @@ final class DeviceManager {
             Unmanaged<DeviceManager>.fromOpaque(context!).takeUnretainedValue().detach(device)
         }, context)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+
+        // Keyboards of any make, to know that they are there.
+        IOHIDManagerSetDeviceMatching(keyboards, [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Keyboard] as CFDictionary)
+        IOHIDManagerRegisterDeviceMatchingCallback(keyboards, { context, _, _, device in
+            Unmanaged<DeviceManager>.fromOpaque(context!).takeUnretainedValue().noticed(device)
+        }, context)
+        IOHIDManagerRegisterDeviceRemovalCallback(keyboards, { context, _, _, device in
+            Unmanaged<DeviceManager>.fromOpaque(context!).takeUnretainedValue().detach(device)
+        }, context)
+        IOHIDManagerScheduleWithRunLoop(keyboards, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+    }
+
+    /// A keyboard was plugged in, or was there already. Somebody else's is noted, and opened
+    /// only if the user has asked for it; Razer's own arrive by the other manager.
+    private func noticed(_ hidDevice: IOHIDDevice) {
+        guard Self.describe(hidDevice).id.vendor != Self.razerVendorID else { return }
+        if !others.contains(where: { CFEqual($0, hidDevice) }) { others.append(hidDevice) }
+        attach(hidDevice)
     }
 
     private func attach(_ hidDevice: IOHIDDevice) {
         func int(_ key: String) -> Int { (IOHIDDeviceGetProperty(hidDevice, key as CFString) as? NSNumber)?.intValue ?? 0 }
+        let vendorID = int(kIOHIDVendorIDKey)
         let productID = int(kIOHIDProductIDKey)
         let locationID = int(kIOHIDLocationIDKey)
-        let name = (IOHIDDeviceGetProperty(hidDevice, kIOHIDProductKey as CFString) as? String) ?? "Razer device"
+        var name = (IOHIDDeviceGetProperty(hidDevice, kIOHIDProductKey as CFString) as? String) ?? "Razer device"
+        if vendorID != Self.razerVendorID {
+            // Somebody else's keyboard (see `noticed`): not unless it has been asked for.
+            let seen = Self.describe(hidDevice)
+            name = seen.name
+            guard wanted.contains(seen.id) else { return scheduleSettle() }
+        }
 
         let device: RazerDevice
-        if let existing = devices.first(where: { $0.productID == productID && $0.locationID == locationID }) {
+        if let existing = devices.first(where: { $0.vendorID == vendorID && $0.productID == productID && $0.locationID == locationID }) {
             device = existing
         } else {
-            device = RazerDevice(productID: productID, locationID: locationID, name: name)
+            device = RazerDevice(vendorID: vendorID, productID: productID, locationID: locationID, name: name)
             devices.append(device)
         }
         guard !device.interfaces.contains(where: { CFEqual($0.device, hidDevice) }) else { return }
@@ -375,7 +442,7 @@ final class DeviceManager {
         device.interfaces.sort { $0.number < $1.number }
         // A keyboard's pointer interface carries one thing: the volume roller, which in driver mode
         // shows up as a scroll wheel. Taking it exclusively keeps it from scrolling windows.
-        interface.open(seize: device.kind == .keyboard && interface.isMouse) { context, _, _, _, _, report, length in
+        interface.open(seize: device.isRazer && device.kind == .keyboard && interface.isMouse) { context, _, _, _, _, report, length in
             let interface = Unmanaged<HIDInterface>.fromOpaque(context!).takeUnretainedValue()
             interface.owner?.manager?.handleReport(interface, Array(UnsafeBufferPointer(start: report, count: length)))
         }
@@ -388,7 +455,8 @@ final class DeviceManager {
         // A keyboard's ordinary keys, for the ones that have been given something else to do.
         // (A mouse's typed keys are read from its reports, below.)
         if device.kind == .keyboard {
-            interface.watchKeys { context, _, _, value in
+            // Of another make's keyboard, every interface we are handed has keys to report.
+            interface.watchKeys(whateverItIs: !device.isRazer) { context, _, _, value in
                 let interface = Unmanaged<HIDInterface>.fromOpaque(context!).takeUnretainedValue()
                 let element = IOHIDValueGetElement(value)
                 let usage = IOHIDElementGetUsage(element)
@@ -396,13 +464,28 @@ final class DeviceManager {
                 interface.owner?.manager?.keyChanged(interface, UInt8(usage), down: IOHIDValueGetIntegerValue(value) != 0)
             }
         }
-        if interface.isControl && interface.openResult == kIOReturnSuccess {
+        if device.isRazer && interface.isControl && interface.openResult == kIOReturnSuccess {
             device.control = RazerControl(device: hidDevice)
         }
         scheduleSettle()
     }
 
+    /// The list of keyboards to look after changed: lets go of the ones dropped from it and
+    /// takes up the ones added that are plugged in.
+    private func reconcile() {
+        for device in devices where !device.isRazer && !wanted.contains(device.id) {
+            for interface in device.interfaces { interface.close() }
+            device.interfaces.removeAll()
+            log("device let go: \(device.name)")
+        }
+        devices.removeAll { $0.interfaces.isEmpty }
+        // `attach` passes over what is already open, and what is not wanted.
+        for device in others { attach(device) }
+        scheduleSettle()
+    }
+
     private func detach(_ hidDevice: IOHIDDevice) {
+        others.removeAll { CFEqual($0, hidDevice) }
         for device in devices {
             guard let index = device.interfaces.firstIndex(where: { CFEqual($0.device, hidDevice) }) else { continue }
             if device.interfaces[index].isControl { device.control = nil }
@@ -425,6 +508,9 @@ final class DeviceManager {
     fileprivate func handleReport(_ interface: HIDInterface, _ bytes: [UInt8]) {
         guard let device = interface.owner, !bytes.isEmpty else { return }
         onReport?(device, interface, bytes)
+        // What follows is how Razer devices report. Another make's keyboard is read key by
+        // key (see `keyChanged`), whatever its reports look like.
+        guard device.isRazer else { return }
 
         if interface.isKeyboard && interface.maxInput > 8 {
             // Multi-report interface: the first byte is the report ID.
