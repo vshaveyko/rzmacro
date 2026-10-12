@@ -18,27 +18,42 @@ extension Config {
         }
         var matches: [Daemon.ActivePartial] = []
         for profile in profiles where profile.partial == partial {
-            var best: Daemon.ProfileReason?
-            for app in profile.apps {
-                guard app == front || (profile.whileRunning && isRunning(app)) else { continue }
-                var reason = app == front ? Daemon.ProfileReason.appInFront(app) : .appRunning(app)
-                if app == DotaWatcher.bundleID {
-                    if let wanted = profile.dota {
-                        guard activity == wanted else { continue }
-                        reason = .dota(wanted)
-                    }
-                    if !profile.heroes.isEmpty {
-                        guard let hero, profile.heroes.contains(hero) else { continue }
-                        reason = .hero(hero)
-                    }
-                }
-                if best.map({ reason.rank < $0.rank }) ?? true { best = reason }
+            if let rule = rule(of: profile, front: front, hero: hero, activity: activity, isRunning: isRunning) {
+                matches.append(Daemon.ActivePartial(name: profile.name, reason: rule))
             }
-            if let best { matches.append(Daemon.ActivePartial(name: profile.name, reason: best)) }
         }
         return matches.enumerated()
             .sorted { ($0.element.reason.rank, $0.offset) < ($1.element.reason.rank, $1.offset) }
             .map(\.element)
+    }
+
+    /// The rule of a profile that holds, the most specific if several do.
+    private func rule(of profile: Profile, front: String?, hero: String?, activity: DotaActivity?, isRunning: (String) -> Bool) -> Daemon.ProfileReason? {
+        var best: Daemon.ProfileReason?
+        for app in profile.apps {
+            guard app == front || (profile.whileRunning && isRunning(app)) else { continue }
+            var reason = app == front ? Daemon.ProfileReason.appInFront(app) : .appRunning(app)
+            if app == DotaWatcher.bundleID {
+                if let wanted = profile.dota {
+                    guard activity == wanted else { continue }
+                    reason = .dota(wanted)
+                }
+                if !profile.heroes.isEmpty {
+                    guard let hero, profile.heroes.contains(hero) else { continue }
+                    reason = .hero(hero)
+                }
+            }
+            if best.map({ reason.rank < $0.rank }) ?? true { best = reason }
+        }
+        return best
+    }
+
+    /// The app a profile whose rules do not hold is waiting for: everything else they ask for
+    /// is so, and the profile would be on if only that app were in front. The window being
+    /// looked at is itself an app in front, so this is what a game's profile shows there.
+    func awaitedApp(of profile: Profile, hero: String?, activity: DotaActivity?) -> String? {
+        guard autoSwitch else { return nil }
+        return profile.apps.first { rule(of: profile, front: $0, hero: hero, activity: activity, isRunning: { _ in false }) != nil }
     }
 }
 
@@ -70,8 +85,12 @@ final class Daemon {
     /// happened and why, for a note on screen.
     var onProfileChanged: ((_ name: String, _ detail: String) -> Void)?
     /// While set, the next ordinary key pressed on the keyboard goes here instead of doing
-    /// anything (the window's "pick a key by pressing it").
-    var onKeyPick: ((Trigger) -> Void)?
+    /// anything (the window's "pick a key by pressing it"). Pressed with modifiers held, it is
+    /// the combination that goes; a modifier pressed and let go by itself is that key.
+    var onKeyPick: ((Trigger) -> Void)? {
+        didSet { keyPick = KeyPick() }
+    }
+    private var keyPick = KeyPick()
     /// The window is recording key presses. Until it stops the keyboard's keys are themselves
     /// again, so that what is recorded is the key pressed, not what a profile makes of it.
     var isRecordingKeys = false {
@@ -159,14 +178,28 @@ final class Daemon {
         get { UserDefaults.standard.stringArray(forKey: "partials") ?? [] }
         set { UserDefaults.standard.set(newValue, forKey: "partials") }
     }
-    /// Partial profiles switched off by hand while a rule asks for them. That lasts until the
-    /// rule stops asking.
-    private var partialsOverruled = Set<String>()
+    /// Partial profiles switched off by hand: off whatever their rules ask for, until they are
+    /// switched back. A rule that goes by the app in front stops asking whenever another app
+    /// comes to the front — this window, too — so this cannot end when the rule does.
+    private(set) var partialsOff: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "partialsOff") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "partialsOff") }
+    }
+    /// How a partial profile is switched: by its rules, or by hand whatever they ask for.
+    enum PartialSwitch: String {
+        case automatic = "auto", on, off
+    }
+    /// Partial profiles that are off for no reason but that their app is not in front, and
+    /// that app.
+    private(set) var awaitedApps: [String: String] = [:]
     /// Every assignment in force: the active profile's, and on top the partial profiles'.
     private var layer: [Trigger: Assignment] = [:]
     private var lastDotaStatus = DotaWatcher.Status()
     /// Key-downs we swallowed; the matching key-up must go too.
     private var swallowed = Set<CGKeyCode>()
+    /// Combinations being held, by the key that completed them: its key-up is the
+    /// combination's, whichever modifiers are still down by then.
+    private var combosDown: [CGKeyCode: Trigger] = [:]
     /// The same for mouse buttons, by button number.
     private var swallowedButtons = Set<Int>()
     private var modeOverride: [DeviceKind: DeviceMode] = [:]
@@ -514,12 +547,15 @@ final class Daemon {
         if name == nil { reason = .chosen }
 
         // The partial ones go on top of it, whichever it is: those switched on by hand above
-        // those the rules ask for.
+        // those the rules ask for, less those switched off by hand.
         let asked = automaticMatches(partial: true)
-        partialsOverruled.formIntersection(asked.map(\.name))
-        let byHandNames = partialsByHand
+        let byHandNames = partialsByHand, off = partialsOff
         var partials = config.profiles.filter { $0.partial && byHandNames.contains($0.name) }.map { ActivePartial(name: $0.name, reason: .chosen) }
-        partials += asked.filter { ask in !partialsOverruled.contains(ask.name) && !partials.contains { $0.name == ask.name } }
+        partials += asked.filter { ask in !off.contains(ask.name) && !partials.contains { $0.name == ask.name } }
+        awaitedApps = [:]
+        for profile in config.profiles where profile.partial && !off.contains(profile.name) && !partials.contains(where: { $0.name == profile.name }) {
+            awaitedApps[profile.name] = config.awaitedApp(of: profile, hero: dota.hero, activity: dota.activity)
+        }
 
         let changed = name != activeProfile
         let came = partials.filter { new in !activePartials.contains { $0.name == new.name } }
@@ -560,17 +596,40 @@ final class Daemon {
         activePartials.first { config.bindings(of: $0.name)[trigger] != nil }?.name ?? activeProfile ?? Profile.defaultName
     }
 
+    /// How a partial profile is switched.
+    func partialSwitch(of name: String) -> PartialSwitch {
+        if partialsByHand.contains(name) { return .on }
+        return partialsOff.contains(name) ? .off : .automatic
+    }
+
+    /// Switches a partial profile on or off by hand, to stay so whatever its rules ask for, or
+    /// hands it back to them.
+    func setPartialSwitch(_ name: String, to value: PartialSwitch) {
+        guard let profile = config.profile(named: name), profile.partial else { return }
+        if partialSwitch(of: profile.name) != value {
+            partialsByHand.removeAll { $0 == profile.name }
+            partialsOff.removeAll { $0 == profile.name }
+            switch value {
+            case .on: partialsByHand.append(profile.name)
+            case .off: partialsOff.append(profile.name)
+            case .automatic: break
+            }
+        }
+        refreshProfile(byHand: true)
+    }
+
     /// Switches profile by hand: a profile's name, "default", "next", "previous", or "auto" to
     /// hand the choice back to the rules. A partial profile's name switches it on, or off if
-    /// it is on. Returns a line saying where that leaves things.
+    /// it is on; followed by "on", "off" or "auto", it says which. Returns a line saying where
+    /// that leaves things.
     @discardableResult
     func switchProfile(_ word: String) -> String {
         let names: [String?] = [nil] + config.profiles.filter { !$0.partial }.map { Optional($0.name) }
         let target: String?
         switch word.lowercased() {
         case "auto":
+            // The profile in use only: a partial one is switched by itself.
             isOverruled = false
-            partialsOverruled.removeAll()
             refreshProfile(byHand: true)
             return profileLine
         case "next", "previous":
@@ -580,16 +639,22 @@ final class Daemon {
         case "default":
             target = nil
         default:
-            guard let profile = config.profile(named: word) else { return "there is no profile named \"\(word)\"" }
-            if profile.partial {
-                if activePartials.contains(where: { $0.name == profile.name }) {
-                    partialsByHand.removeAll { $0 == profile.name }
-                    // Where a rule asks for it, that overrules the rule (see `refreshProfile`).
-                    partialsOverruled.insert(profile.name)
-                } else if partialsOverruled.remove(profile.name) == nil {
-                    partialsByHand.append(profile.name)
+            guard let profile = config.profile(named: word) else {
+                // "<partial profile> on", "… off", "… auto".
+                let words = word.split(separator: " ")
+                if let last = words.last, let value = PartialSwitch(rawValue: last.lowercased()),
+                   let partial = config.profile(named: words.dropLast().joined(separator: " ")), partial.partial {
+                    setPartialSwitch(partial.name, to: value)
+                    return profileLine
                 }
-                refreshProfile(byHand: true)
+                return "there is no profile named \"\(word)\""
+            }
+            if profile.partial {
+                // One press switches it on, the next off: by letting its rules have their way
+                // where that does it, and over them where it does not.
+                let isOn = activePartials.contains { $0.name == profile.name }
+                let isAsked = automaticMatches(partial: true).contains { $0.name == profile.name }
+                setPartialSwitch(profile.name, to: isOn ? (isAsked ? .off : .automatic) : (isAsked ? .automatic : .on))
                 return profileLine
             }
             target = profile.name
@@ -611,7 +676,8 @@ final class Daemon {
         if chosenProfile == old { chosenProfile = new }
         if overrulingProfile == old { overrulingProfile = new }
         if partialsByHand.contains(old) { partialsByHand = partialsByHand.map { $0 == old ? new : $0 } }
-        if partialsOverruled.remove(old) != nil { partialsOverruled.insert(new) }
+        if partialsOff.contains(old) { partialsOff = partialsOff.map { $0 == old ? new : $0 } }
+        if let app = awaitedApps.removeValue(forKey: old) { awaitedApps[new] = app }
         activePartials = activePartials.map { $0.name == old ? ActivePartial(name: new, reason: $0.reason) : $0 }
         if activeProfile == old { activeProfile = new }
         if automaticProfile == old { automaticProfile = new }
@@ -628,6 +694,7 @@ final class Daemon {
         lines.append(line(nil, "\(config.bindings.count) assignments"))
         for profile in config.profiles {
             var rules: [String] = profile.partial ? ["partial"] : []
+            if profile.partial && partialsOff.contains(profile.name) { rules.append("switched off by hand (`rzmacro profile \(profile.name) auto` hands it back to its rules)") }
             if !profile.apps.isEmpty { rules.append("\(profile.whileRunning ? "while running" : "in front"): \(profile.apps.map(appDisplayName).joined(separator: ", "))") }
             if let dota = profile.dota { rules.append("only \(ProfileReason.dota(dota).text)") }
             if !profile.heroes.isEmpty { rules.append("only playing \(profile.heroes.map(DotaHeroes.title).joined(separator: ", "))") }
@@ -635,6 +702,7 @@ final class Daemon {
                 if let base = profile.basedOn, base != Profile.defaultName { rules.append("based on \(base)") }
                 if profile.basedOn == nil { rules.append("stands alone") }
             }
+            if let app = awaitedApps[profile.name] { rules.append("off now, on when \(appDisplayName(app)) is \(profile.whileRunning ? "running" : "in front")") }
             lines.append(line(profile.name, (["\(profile.bindings.count) assignments"] + rules).joined(separator: "; ")))
         }
         return lines.joined(separator: "\n")
@@ -713,9 +781,14 @@ final class Daemon {
             // Typing is nobody's business: a key is looked at only if it has been given
             // something to do, or the window is asking which key is meant.
             if !verboseSniffers.isEmpty { broadcast("key     \(trigger.displayName) \(pressed ? "down" : "up")", verboseOnly: true) }
-            if pressed, let pick = onKeyPick {
-                onKeyPick = nil
-                return pick(trigger)
+            if let pick = onKeyPick, case .key(let usage) = source {
+                switch keyPick.take(usage, pressed: pressed) {
+                case .picked(let source):
+                    onKeyPick = nil
+                    return pick(Trigger(kind: .keyboard, source: source))
+                case .waiting: return
+                case .notItsOwn: break
+                }
             }
             if pressed && isRecordingKeys { return }
             if pressed, lookup(trigger) != nil {
@@ -810,7 +883,9 @@ final class Daemon {
     private var tappedEvents: [CGEventType] {
         let bound = layer.keys.filter { $0.kind == .mouse }.map(\.source)
         var events: [CGEventType] = []
-        if fnLayerActive || bound.contains(where: { if case .key = $0 { return true } else { return false } }) {
+        // A combination being held is watched to its key-up, whatever the profile has become.
+        if fnLayerActive || !combosDown.isEmpty || layer.keys.contains(where: \.isCombination)
+            || bound.contains(where: { if case .key = $0 { return true } else { return false } }) {
             events += [.keyDown, .keyUp]
         }
         if bound.contains(where: { if case .button = $0 { return true } else { return false } }) {
@@ -831,7 +906,8 @@ final class Daemon {
         }
     }
 
-    private func shouldSwallow(_ type: CGEventType, _ event: CGEvent) -> Bool {
+    /// Whether an event the tap has caught is to go no further.
+    func shouldSwallow(_ type: CGEventType, _ event: CGEvent) -> Bool {
         switch type {
         case .keyDown, .keyUp: return shouldSwallowKey(type, event)
         case .rightMouseDown, .otherMouseDown:
@@ -871,8 +947,16 @@ final class Daemon {
 
     private func shouldSwallowKey(_ type: CGEventType, _ event: CGEvent) -> Bool {
         let code = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-        if type == .keyUp { return swallowed.remove(code) != nil }
+        if type == .keyUp {
+            if let trigger = combosDown.removeValue(forKey: code) {
+                comboChanged(trigger, down: false)
+                return true
+            }
+            return swallowed.remove(code) != nil
+        }
         guard type == .keyDown else { return false }
+        // Still held, repeating: the combination's, even with its modifiers let go.
+        if combosDown[code] != nil { return true }
 
         if fnHeld {
             switch code {
@@ -898,7 +982,35 @@ final class Daemon {
             return true
         }
         swallowed.remove(code)
+
+        // A combination that has been given something to do never reaches the app in front:
+        // ⌘Q does not quit. Not while the window records keys or picks one — it wants them.
+        if !isRecordingKeys, onKeyPick == nil, let source = KeySource(combo: usage, flags: event.flags) {
+            let trigger = Trigger(kind: .keyboard, source: source)
+            if lookup(trigger) != nil {
+                combosDown[code] = trigger
+                comboChanged(trigger, down: true)
+                return true
+            }
+        }
         return false
+    }
+
+    /// A combination went down or came up: seen by the event tap, as it is nothing a device
+    /// reports. Runs what it is assigned to, like a button's.
+    private func comboChanged(_ trigger: Trigger, down: Bool) {
+        onButton?(trigger, down)
+        if down {
+            guard let binding = lookup(trigger) else { return }
+            if !sniffers.isEmpty { broadcast("event   \(trigger) down  → \(binding.summary) [\(decider(of: trigger))]") }
+            active[trigger] = binding
+            engine.press(id: trigger.description, assignment: binding)
+        } else {
+            if !sniffers.isEmpty { broadcast("event   \(trigger) up") }
+            if let binding = active.removeValue(forKey: trigger) { engine.release(id: trigger.description, assignment: binding) }
+            // With the last of them up, the keys may no longer need watching.
+            if combosDown.isEmpty { DispatchQueue.main.async { [weak self] in self?.updateTap() } }
+        }
     }
 
     // MARK: Sniffing
@@ -996,6 +1108,10 @@ final class Daemon {
         for trigger in config.bindings.keys.map(\.displayName).sorted() { lines.append("    \(trigger)") }
         lines.append(profileLine)
         lines.append("keyboard keys: \(remapper.status)")
+        let combinations = layer.keys.filter(\.isCombination).compactMap { $0.source.chord?.description }.sorted()
+        if !combinations.isEmpty {
+            lines.append("key combinations: \(combinations.joined(separator: ", "))" + (tap.isRunning ? "" : "  NOT CAUGHT (needs the Accessibility permission)"))
+        }
         lines.append(dotaText())
         lines.append("lighting: \(lighting.status)")
         lines.append("devices:")

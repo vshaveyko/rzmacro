@@ -158,6 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     item.target = self
                     item.representedObject = profile.name
                     item.state = daemon.activePartials.contains { $0.name == profile.name } ? .on : .off
+                    // Off for good, not just for now: its rules will not bring it back.
+                    if daemon.partialSwitch(of: profile.name) == .off { item.badge = NSMenuItemBadge(string: "Off by hand") }
                     menu.addItem(item)
                 }
             }

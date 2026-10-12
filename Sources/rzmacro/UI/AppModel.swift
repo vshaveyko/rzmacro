@@ -58,12 +58,17 @@ final class AppModel: ObservableObject {
     @Published var isOverruled = false
     /// The partial profiles that are on right now, on top of that one.
     @Published var activePartials: [Daemon.ActivePartial] = []
+    /// The partial profiles switched off by hand, whatever their rules ask for.
+    @Published var partialsOff: Set<String> = []
+    /// The partial profiles that are off only for their app not being in front, and that app.
+    @Published var awaitedApps: [String: String] = [:]
     @Published var dota = DotaWatcher.Status()
     /// Whether Dota 2 is started with the launch option hero detection needs; nil if unknown.
     @Published var dotaLaunchOption: Bool?
     @Published var dotaError: String?
     /// Waiting for a key to be pressed on the keyboard, to select it.
     @Published var isPickingKey = false
+    private var pickMonitor: Any?
     /// The macro open on the Macros page.
     @Published var selectedMacro: String?
     /// Buttons physically held right now, for highlighting.
@@ -134,6 +139,8 @@ final class AppModel: ObservableObject {
         profileReason = daemon.profileReason.text
         isOverruled = daemon.isOverruled
         activePartials = daemon.activePartials
+        partialsOff = Set(daemon.partialsOff)
+        awaitedApps = daemon.awaitedApps
         dota = daemon.dotaStatus
     }
 
@@ -163,7 +170,7 @@ final class AppModel: ObservableObject {
     private func button(_ trigger: Trigger, _ down: Bool) {
         if down { pressed.insert(trigger) } else { pressed.remove(trigger) }
         // An ordinary key lights up while held, no more: it is typed on all the time.
-        if trigger.isOrdinaryKey { return }
+        if trigger.isTyped { return }
         // Clicks and the wheel are in constant use: they shouldn't change what is selected.
         // Fn is the keyboard's own layer key.
         if case .button = trigger.source { return }
@@ -227,26 +234,45 @@ final class AppModel: ObservableObject {
         var seen = Set<Trigger>()
         // Another make's keyboard has none of the special buttons the Razer one's are bound to.
         let special = device(kind)?.isRazer == false ? [] : (config.allBindings.flatMap(\.keys) + seenButtons)
-            .filter { $0.kind == kind && !$0.isOrdinaryKey && !known.contains($0) && seen.insert($0).inserted }
+            .filter { $0.kind == kind && !$0.isTyped && !known.contains($0) && seen.insert($0).inserted }
             .sorted { $0.description < $1.description }
+        // Keys first, then the combinations of them.
         let ordinary = (Array(shownLayer(for: editing).keys) + (selectedButton[kind].map { [$0] } ?? []))
-            .filter { $0.kind == kind && $0.isOrdinaryKey && seen.insert($0).inserted }
-            .sorted { $0.description < $1.description }
+            .filter { $0.kind == kind && $0.isTyped && seen.insert($0).inserted }
+            .sorted { ($0.isCombination ? 1 : 0, $0.description) < ($1.isCombination ? 1 : 0, $1.description) }
         return listed + (special + ordinary).map(DeviceKey.init(unlisted:))
     }
 
-    /// Selects the next ordinary key pressed on the keyboard, instead of that key doing anything.
+    /// Selects the next ordinary key pressed on the keyboard, instead of that key doing
+    /// anything — or, pressed with modifiers held, the combination.
     func pickKey() {
         isPickingKey = true
+        // What is pressed must not reach the window: ⌘W would close it, ⌘Q quit.
+        if pickMonitor == nil {
+            pickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+                // The driver hears of the key before the window does: wait for it to come up.
+                if event.type == .keyUp, self?.isPickingKey == false { self?.stopPickMonitor() }
+                return nil
+            }
+        }
         daemon.onKeyPick = { [weak self] trigger in
-            self?.isPickingKey = false
-            self?.selectedButton[.keyboard] = trigger
+            guard let self else { return }
+            self.isPickingKey = false
+            self.selectedButton[.keyboard] = trigger
+            // A modifier picked by itself sends no key-up to wait for.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if !self.isPickingKey { self.stopPickMonitor() } }
         }
     }
 
     func cancelKeyPick() {
         daemon.onKeyPick = nil
         isPickingKey = false
+        stopPickMonitor()
+    }
+
+    private func stopPickMonitor() {
+        if let pickMonitor { NSEvent.removeMonitor(pickMonitor) }
+        pickMonitor = nil
     }
 
     func devices(of kind: DeviceKind) -> [Daemon.DeviceSummary] { devices.filter { $0.kind == kind } }
@@ -339,6 +365,35 @@ final class AppModel: ObservableObject {
         updateProfile(profile) { $0.bindings[trigger] = assignment }
     }
 
+    // MARK: ⌘Q
+
+    /// What ⌘Q does while a profile is on: a quick way to the assignment that keeps a game
+    /// from being quit by the key next to its Alt.
+    enum QuitKey: Hashable {
+        case quits, sendsOption, nothing
+        /// Given something else to do, on the keyboard page.
+        case other
+    }
+
+    static let quitCombination = Trigger(kind: .keyboard, source: KeySource(combo: try! Chord("cmd+q"))!)
+    /// ⌥Q for as long as it is held, as the key itself would be.
+    static let optionQ = Assignment(steps: [.tap(try! Chord("alt+q"))], hold: true)
+
+    func quitKey(in profile: String) -> QuitKey {
+        guard let assignment = config.bindings(of: profile)[Self.quitCombination] else { return .quits }
+        if assignment == Self.optionQ { return .sendsOption }
+        return assignment.steps.isEmpty ? .nothing : .other
+    }
+
+    func setQuitKey(_ value: QuitKey, in profile: String) {
+        switch value {
+        case .quits: setAssignment(nil, for: Self.quitCombination, profile: profile)
+        case .sendsOption: setAssignment(Self.optionQ, for: Self.quitCombination, profile: profile)
+        case .nothing: setAssignment(Assignment(steps: []), for: Self.quitCombination, profile: profile)
+        case .other: break
+        }
+    }
+
     // MARK: Profiles
 
     /// The profile being edited, if it still exists; nil is the default bindings.
@@ -353,6 +408,28 @@ final class AppModel: ObservableObject {
 
     /// Why a partial profile is on, or nil if it is off.
     func partialReason(_ name: String) -> String? { activePartials.first { $0.name == name }?.text }
+
+    /// How a partial profile is switched: by its rules, or by hand whatever they ask for.
+    func partialSwitch(of name: String) -> Daemon.PartialSwitch {
+        if activePartials.contains(where: { $0.name == name && $0.reason == .chosen }) { return .on }
+        return partialsOff.contains(name) ? .off : .automatic
+    }
+
+    func setPartialSwitch(_ name: String, to value: Daemon.PartialSwitch) {
+        flushSave()
+        daemon.setPartialSwitch(name, to: value)
+    }
+
+    /// What a partial profile is doing right now and why, in a few words. One that goes by the
+    /// app in front is off while this window is: said so, it does not look broken.
+    func partialStatus(of profile: Profile) -> (text: String, isOn: Bool, isWaiting: Bool) {
+        if let reason = partialReason(profile.name) { return ("On now — \(reason)", true, false) }
+        if partialsOff.contains(profile.name) { return ("Off — switched off by hand", false, false) }
+        if let app = awaitedApps[profile.name] {
+            return ("Off now — on when \(Self.appName(app)) is \(profile.whileRunning ? "running" : "in front")", false, true)
+        }
+        return ("Off", false, false)
+    }
 
     /// Whether a profile is doing anything right now: the one in use, or a partial one that is on.
     func isInUse(_ name: String?) -> Bool { activeProfile == name || activePartials.contains { $0.name == name } }

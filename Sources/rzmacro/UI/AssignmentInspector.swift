@@ -121,7 +121,7 @@ struct AssignmentInspector: View {
             guard let stepKind = new.stepKind else { return }
             armShortcut = new == .shortcut
             // A key given a key is that key for as long as it is held, unless told otherwise.
-            set(Assignment(steps: [stepKind.makeStep(macros: macroNames)], hold: new == .shortcut && key.trigger.isOrdinaryKey))
+            set(Assignment(steps: [stepKind.makeStep(macros: macroNames)], hold: new == .shortcut && key.trigger.isTyped))
         }
     }
 
@@ -138,6 +138,12 @@ struct AssignmentInspector: View {
                         .fixedSize(horizontal: false, vertical: true)
                 } else if let profile, assignment == nil, let inherited = model.effective(key.trigger, profile: profile) {
                     Label("In \(profile) this button does what \(inherited.from ?? Profile.defaultName) says (\(inherited.assignment.summary)). Choose an action to change it here.", systemImage: "arrow.turn.down.right")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if key.trigger.isCombination {
+                    Label("Caught wherever it is typed, on any keyboard, once the keys themselves have been remapped. Given something to do, the combination itself never reaches the app in front.", systemImage: "command")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.secondary)
                         .fixedSize(horizontal: false, vertical: true)

@@ -114,4 +114,14 @@ extension Trigger {
         if kind == .keyboard, case .key = source { return true }
         return false
     }
+
+    /// A key typed with modifiers held, rather than a key by itself.
+    var isCombination: Bool {
+        if case .combo = source { return true }
+        return false
+    }
+
+    /// Something typed on the keyboard — a key, or a combination of them — rather than one of
+    /// its special buttons.
+    var isTyped: Bool { isOrdinaryKey || isCombination }
 }

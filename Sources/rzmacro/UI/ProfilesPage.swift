@@ -135,20 +135,21 @@ struct ProfilesPage: View {
 
     /// Whether a partial profile is on, with the means to switch it.
     private func onRow(_ profile: Profile) -> some View {
-        HStack(spacing: 8) {
-            if let reason = model.partialReason(profile.name) {
-                StatusChip(text: "On now — \(reason)", color: Theme.good, dot: true)
-                Button("Switch Off") { model.useProfile(profile.name) }
-                    .buttonStyle(PillButtonStyle(compact: true))
-                    .help(profile.isAutomatic
-                          ? "Switch it off by hand. If an app, game or hero has it on, it stays off until that one has gone and come back."
-                          : "Switch it off again.")
+        let status = model.partialStatus(of: profile)
+        let choice = Binding(get: { model.partialSwitch(of: profile.name) }, set: { model.setPartialSwitch(profile.name, to: $0) })
+        return HStack(spacing: 10) {
+            if profile.isAutomatic {
+                // Its rules switch it, unless told otherwise: and what is told here stays told.
+                Segmented(options: [(Daemon.PartialSwitch.automatic, "Automatic"), (.on, "On"), (.off, "Off")], selection: choice)
+                    .frame(width: 250)
+                    .help("Automatic: on whenever its app, game or hero asks for it. On: on everywhere, until you choose otherwise. Off: off whatever asks for it, until you choose otherwise.")
             } else {
-                StatusChip(text: "Off", color: Theme.tertiary, dot: true)
-                Button("Switch On") { model.useProfile(profile.name) }
-                    .buttonStyle(PillButtonStyle(kind: .primary, compact: true))
-                    .help("Switch it on by hand, on top of whichever profile is in use. It stays on until you switch it off.")
+                Segmented(options: [(Daemon.PartialSwitch.on, "On"), (.automatic, "Off")],
+                          selection: Binding(get: { choice.wrappedValue == .on ? .on : .automatic }, set: { choice.wrappedValue = $0 }))
+                    .frame(width: 130)
+                    .help("On top of whichever profile is in use, until you switch it off.")
             }
+            StatusChip(text: status.text, color: status.isOn ? Theme.good : (status.isWaiting ? Theme.warning : Theme.tertiary), dot: true)
             Spacer(minLength: 0)
         }
     }
@@ -164,7 +165,7 @@ struct ProfilesPage: View {
 
     private func counted(_ bindings: [Trigger: Assignment]) -> String {
         if bindings.isEmpty { return "Nothing assigned yet." }
-        let keys = bindings.keys.filter(\.isOrdinaryKey).count
+        let keys = bindings.keys.filter(\.isTyped).count
         let buttons = bindings.count - keys
         var parts: [String] = []
         if buttons > 0 { parts.append("\(buttons) button\(buttons == 1 ? "" : "s")") }
@@ -271,6 +272,8 @@ struct ProfilesPage: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 editButtons(profile.name)
+                Rectangle().fill(Theme.stroke).frame(height: 1)
+                quitKey(profile)
             }
 
             section("Switch it on automatically") {
@@ -291,6 +294,27 @@ struct ProfilesPage: View {
             quickSwitching(profile.partial ? profile : nil)
 
             Button("Delete Profile") { delete(profile) }.buttonStyle(PillButtonStyle(kind: .danger))
+        }
+    }
+
+    /// What ⌘Q does while the profile is on. In a game played with ⌘ under the thumb in Alt's
+    /// place, it quits the game: here it can be the game's ⌥Q instead.
+    private func quitKey(_ profile: Profile) -> some View {
+        let choice = model.quitKey(in: profile.name)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text("⌘Q").font(.system(size: 13, weight: .medium))
+                Segmented(options: [(AppModel.QuitKey.quits, "Quits the app"), (.sendsOption, "Sends ⌥Q"), (.nothing, "Does nothing")],
+                          selection: Binding(get: { choice }, set: { model.setQuitKey($0, in: profile.name) }))
+                    .frame(width: 380)
+                Spacer(minLength: 0)
+            }
+            Text(choice == .other
+                 ? "Here ⌘Q has been given something else to do: \(model.config.bindings(of: profile.name)[AppModel.quitCombination]?.summary ?? ""). Choosing above replaces that."
+                 : "While this profile is \(profile.partial ? "on" : "in use"). In a game played with ⌘ under your thumb where Alt would be, ⌘Q quits the game: have it reach the game as ⌥Q instead, or do nothing. It is an assignment like any other — ⌘Q among the remapped keys on the keyboard page, where any other combination can be changed the same way.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

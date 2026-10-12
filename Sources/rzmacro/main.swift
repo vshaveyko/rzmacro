@@ -19,7 +19,8 @@ func usage() -> Never {
       profile [<name>|default|next|previous|auto]
                              list the profiles, or switch to one by hand ("auto" goes back
                              to whatever the running app or game asks for; a partial
-                             profile's name switches it on, or off again)
+                             profile's name switches it on, or off again — followed by
+                             on, off or auto it says which, and that is how it stays)
       dota [setup|remove]    Dota 2 hero detection: its state, switch it on, switch it off
       press <button> [ms]    run what a button is assigned to, as if it were held that long
       sniff [seconds] [all]  print button events as you press them, and every key the macros
@@ -90,7 +91,7 @@ case "keys":
     print("keys:      " + Keys.table.map(\.0).joined(separator: " "))
     print("aliases:   " + (Keys.aliases.map { "\($0.key)=\($0.value)" } + Keys.modifierAliases.map { "\($0.key)=\($0.value)" }).sorted().joined(separator: " "))
     print("media:     " + MediaKey.allCases.map(\.name).joined(separator: " "))
-    print("keyboard keys that can be reassigned, as keyboard.<name>:")
+    print("keyboard keys that can be reassigned, as keyboard.<name> — or with modifiers, as keyboard.cmd+q:")
     print("           " + KeyboardKeys.all.map(\.name).joined(separator: " "))
 case "config":
     print(Paths.configFile.path)

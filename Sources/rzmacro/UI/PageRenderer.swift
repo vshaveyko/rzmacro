@@ -11,6 +11,8 @@ enum PageRenderer {
     /// drawing, `config=<file>` shows that configuration instead of the real one (display
     /// only). For `render` alone, since it has no driver to ask: `active=<profile>` says which
     /// profile is in use, `on=<partial>+<partial>` which partial profiles are on,
+    /// `off=<partial>+<partial>` which are switched off by hand, `waiting=<partial>+<partial>`
+    /// which are off only for their app not being in front,
     /// `hero=<name>` which Dota hero is being played, `dota=playing|menu` what the game is
     /// doing without one, and `stuck=<key>+<key>`
     /// connects the page's device with those keys stuck down. `keyboard=<name>` (a layout
@@ -35,6 +37,12 @@ enum PageRenderer {
                 model.profileReason = "chosen by hand"
             case "on":
                 model.activePartials = name.split(separator: "+").map { Daemon.ActivePartial(name: String($0), reason: .chosen) }
+            case "off":
+                model.partialsOff = Set(name.split(separator: "+").map(String.init))
+            case "waiting":
+                for partial in name.split(separator: "+").map(String.init) {
+                    model.awaitedApps[partial] = model.config.profile(named: partial)?.apps.first
+                }
             case "hero":
                 model.dota = DotaWatcher.Status(found: true, installed: true, port: 35570, running: true, receiving: true, hero: pair[1], activity: .playing)
                 model.dotaLaunchOption = true

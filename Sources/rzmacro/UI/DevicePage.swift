@@ -45,8 +45,13 @@ struct DeviceKey: Identifiable {
     /// or one of a keyboard's ordinary keys.
     init(unlisted trigger: Trigger) {
         self.trigger = trigger
-        group = trigger.isOrdinaryKey ? Self.ordinaryGroup : "Other buttons"
+        group = trigger.isTyped ? Self.ordinaryGroup : "Other buttons"
         switch trigger.source {
+        case .combo:
+            let display = trigger.source.chord?.display ?? trigger.description
+            label = display
+            name = "\(display) on any keyboard"
+            defaultBehaviour = "Its usual job"
         case .key(let usage) where trigger.isOrdinaryKey:
             let key = KeyboardKeys.byUsage[usage]
             label = key?.label ?? String(format: "%02X", usage)
@@ -172,13 +177,14 @@ struct DevicePage: View {
 
     /// Whether what is being edited is what the buttons are doing right now.
     @ViewBuilder private var profileNote: some View {
-        if let partial = model.editing, model.isPartial(partial) {
+        if let partial = model.editing, let profile = model.config.profile(named: partial), profile.partial {
+            let status = model.partialStatus(of: profile)
             if let reason = model.partialReason(partial) {
                 StatusChip(text: "On now", color: Theme.good, dot: true)
                     .help("\(partial) is on (\(reason)), on top of \(model.activeProfile ?? Profile.defaultName). The dimmed buttons are that profile's.")
             } else {
-                StatusChip(text: "Off now", color: Theme.tertiary, dot: true)
-                    .help("What you change here applies while \(partial) is on, on top of whichever profile is in use. The dimmed buttons are those of \(model.activeProfile ?? Profile.defaultName), in use now.")
+                StatusChip(text: status.isWaiting ? status.text : "Off now", color: status.isWaiting ? Theme.warning : Theme.tertiary, dot: true)
+                    .help("\(status.text). What you change here applies while \(partial) is on, on top of whichever profile is in use. The dimmed buttons are those of \(model.activeProfile ?? Profile.defaultName), in use now.")
             }
         } else if !model.config.profiles.isEmpty {
             if model.editing == model.activeProfile {
@@ -205,9 +211,9 @@ struct DevicePage: View {
             tips.append("Tip: press a button on the device to jump straight to it. Buttons light up here while they are held.")
         }
         if kind == .keyboard, device?.isRazer == false {
-            tips = ["Any key can be changed — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it. If the drawing is not your keyboard's layout, choose another in its corner; a key it doesn't show can still be picked by pressing it."]
+            tips = ["Any key can be changed — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it. Press it with modifiers held and it is the combination that changes: ⌘Q into something that does not quit. If the drawing is not your keyboard's layout, choose another in its corner; a key it doesn't show can still be picked by pressing it."]
         } else if kind == .keyboard {
-            tips.append("Any ordinary key can be changed too — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it.")
+            tips.append("Any ordinary key can be changed too — Caps Lock into Escape, say: click it in the drawing, or use Pick a Key and press it. Press it with modifiers held and it is the combination that changes: ⌘Q into something that does not quit.")
         }
         if model.devices(of: kind).count > 1 {
             tips.append("Assignments apply to every \(kind == .keyboard ? "keyboard" : "mouse") RZMacro looks after.")
@@ -296,13 +302,13 @@ struct DevicePage: View {
             HStack(spacing: 10) {
                 if model.isPickingKey {
                     RecordingDot()
-                    Text("Press the key on the keyboard…").font(.system(size: 12.5, weight: .medium))
+                    Text("Press the key on the keyboard — with ⌘, ⌥, ⌃ or ⇧ held for a combination…").font(.system(size: 12.5, weight: .medium))
                     Button("Cancel") { model.cancelKeyPick() }.buttonStyle(PillButtonStyle(compact: true))
                 } else {
                     Button { model.pickKey() } label: { Label("Pick a Key", systemImage: "keyboard") }
                         .buttonStyle(PillButtonStyle(compact: true))
                         .disabled(device == nil)
-                    Text(isFirst ? "No keys changed yet. Click one in the drawing, or pick it by pressing it." : "…or click one in the drawing.")
+                    Text(isFirst ? "No keys changed yet. Click one in the drawing, or pick it by pressing it — with modifiers held, for a combination such as ⌘Q." : "…or click one in the drawing. Hold modifiers while picking for a combination such as ⌘Q.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(Theme.tertiary)
                 }

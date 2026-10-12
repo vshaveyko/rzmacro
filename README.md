@@ -28,6 +28,8 @@ window to configure them in.
 - **Remap ordinary keys too.** Caps Lock into Escape, Alt and Win swapped, a key that runs a
   macro. A plain key-for-key swap is done by the keyboard driver itself, so it works
   everywhere, games and password fields included.
+- **And combinations of them.** ⌘Q can be something else while a game's profile is on — the
+  game's Alt+Q, say, instead of the end of the game.
 - **Other makes of keyboard, for their keys.** Switch one on in Settings and its keys can be
   remapped and given macros like a Razer keyboard's, with the same profiles. (Lighting and
   macro keys are for Razer devices only.)
@@ -112,6 +114,12 @@ at which app is in front and which are running — their identifiers, nothing el
   and it simply is that key — Caps Lock is Escape. Give it anything else and it works like a
   macro key. Only the Razer keyboard is affected, not the Mac's own — unless you switch
   another keyboard on (below).
+- **Combinations.** Hold modifiers while *Pick a Key* is waiting — ⌘ and Q — and it is the
+  combination that is picked, and listed with the remapped keys. Given something to do, it no
+  longer reaches the app in front: it is caught wherever it is typed, on any keyboard (this
+  needs the Accessibility permission), after the keys themselves have been remapped. For the
+  commonest case there is a switch on each profile's page: **⌘Q** quits the app, is sent as
+  ⌥Q — for a game played with ⌘ under the thumb where Alt would be — or does nothing.
 - **Shortcuts for a game.** A key or button that should be a combination in a game — W as
   Alt+W — wants *Hold down*: the keys go down when you press and come up when you let go, as
   if you held them yourself. *Run once* presses and releases them within a few milliseconds,
@@ -136,9 +144,12 @@ at which app is in front and which are running — their identifiers, nothing el
   what it says, and every other button goes on doing what the profile in use says, whichever
   that is and however often it changes. Several can be on at once; a button two of them change
   goes to one switched on by hand, then to the more specific rule (hero, app in front, app
-  running), then to the one higher in the list. The menu-bar icon, or a button given the
-  *Profile* action, switches one on and off; switched off by hand while its app or hero has it
-  on, it stays off until that app or hero has gone and come back.
+  running), then to the one higher in the list. On the Profiles page each has a switch:
+  *Automatic* leaves it to its apps, games and heroes, *On* and *Off* keep it so whatever they
+  ask for, until you choose otherwise. (A profile for an app in front is off while you are
+  looking at RZMacro's window; the page says what it is waiting for.) The menu-bar icon, or a
+  button given the *Profile* action, switches one on and off; switched off that way while its
+  app or hero has it on, it stays off until it is switched back.
 - **Macros.** *Record* captures the keys you type (optionally with the pauses between them).
   Steps can be changed, reordered, duplicated and added by hand. A **Hold** step keeps a key
   down until you let go of the button, so "Press F4, Hold F4" is a double-tap-and-hold.
@@ -154,7 +165,7 @@ A profile for Dota 2 can be narrowed to the heroes you choose — one layout for
 another for Meepo, on top of a general one for the game — and to a match or to the menus:
 remapped keys during a match, plain ones in the menus, where they are for typing.
 
-![The Profiles page: a partial profile for Dota 2, on during a match while Earthshaker or Tiny is played](docs/profiles.png)
+![The Profiles page: a partial profile for Dota 2, on while Earthshaker is played, with its Automatic / On / Off switch and what ⌘Q does while it is on](docs/profiles.png)
 
 RZMacro learns the hero from Dota itself, through Valve's Game State Integration: the
 interface stream overlays use, in which the game posts its state to addresses listed in
@@ -256,6 +267,7 @@ written by hand (JSON with comments; comments are lost when the app next saves):
 
   bindings: {
     "keyboard.capslock": { keys: "escape", hold: true },   // Caps Lock is Escape
+    "keyboard.cmd+shift+4": { app: "Screenshot" },         // a key with modifiers held
     "keyboard.M1": "cmd+space",
     "keyboard.M2": { text: "hello there" },
     "keyboard.M3": { macro: "Copy to other app" },
@@ -298,7 +310,10 @@ or one of `keys`, `text`, `shell`, `app`, `open`, `media`, `click`, `light`, `ma
 `down`, `up`; a list is a sequence. Options: `hold`, `repeat`, `on: "release"`.
 
 An ordinary key bound to one key with `hold: true` is swapped for it in the keyboard driver;
-with anything else it runs the action and stops typing its own character. Heroes are written
+with anything else it runs the action and stops typing its own character. A key with
+modifiers — `keyboard.cmd+q`, with any of `ctrl`, `alt`, `shift`, `cmd` — is a combination:
+bound, it is kept from the app in front and runs its action instead (`[]` for nothing at
+all). Heroes are written
 the way the game or its players name them (`"invoker"`, `"Anti-Mage"`, `"npc_dota_hero_zuus"`).
 `heroes` and `dota: "playing" | "menu"` narrow a profile's rule for Dota 2 (and put the game
 among its `apps` if it is not there). A `partial: true` profile takes no `basedOn`, and
@@ -316,6 +331,7 @@ rzmacro press keyboard.M1 500       run a button's assignment as if held for 500
 rzmacro profile                     the profiles, and which one is in use and why
 rzmacro profile next                switch by hand: a name, default, next, previous, auto
 rzmacro profile Numpad              a partial profile's name switches it on, or off again
+rzmacro profile Numpad off          or says which, to stay so: on, off, auto (its own rules)
 rzmacro dota                        hero detection: what it hears from the game
 rzmacro sniff                       show button events as you press them
 rzmacro keys                        key names usable in shortcuts

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import IOKit
 import IOKit.hid
@@ -24,6 +25,43 @@ enum KeySource: Hashable, CustomStringConvertible {
     case button(Int)
     /// A notch of the scroll wheel.
     case wheel(up: Bool)
+    /// A key typed with modifiers held — ⌘Q — on any keyboard: the modifiers as bits in the
+    /// order of `comboModifiers`, and the key's keyboard-page usage.
+    case combo(modifiers: UInt8, usage: UInt8)
+
+    /// The modifiers a combination can ask for. Not Fn: macOS sets that by itself on arrows
+    /// and F-keys.
+    static let comboModifiers = Keys.modifiers.filter { $0.name != "fn" }
+
+    /// A combination as the shortcut it is, if this is one.
+    var chord: Chord? {
+        guard case .combo(let bits, let usage) = self, let name = Keys.nameByUsage[usage] else { return nil }
+        return Chord(modifiers: Self.comboModifiers.enumerated().filter { bits & (1 << $0.offset) != 0 }.map(\.element), keyName: name)
+    }
+
+    /// The combination a shortcut is: nil for one with no modifiers, with Fn, or with no key.
+    init?(combo chord: Chord) {
+        guard !chord.modifiers.isEmpty, let usage = chord.keyName.flatMap({ Keys.usageByName[$0] }), usage != 0 else { return nil }
+        var bits: UInt8 = 0
+        for modifier in chord.modifiers {
+            guard let index = Self.comboModifiers.firstIndex(of: modifier) else { return nil }
+            bits |= 1 << index
+        }
+        self = .combo(modifiers: bits, usage: usage)
+    }
+
+    /// The combination a key makes with the modifiers an event says are held, if any are.
+    init?(combo usage: UInt8, flags: CGEventFlags) {
+        guard let name = Keys.nameByUsage[usage] else { return nil }
+        self.init(combo: Chord(modifiers: Self.comboModifiers.filter { flags.contains($0.flag) }, keyName: name))
+    }
+
+    /// The same, from the modifier keys themselves: left or right, either is the modifier.
+    init?(combo usage: UInt8, modifierKeys: [UInt8]) {
+        guard let name = Keys.nameByUsage[usage] else { return nil }
+        let held = Self.comboModifiers.filter { modifier in modifierKeys.contains { UInt64($0 & 0xfb) == modifier.usage & 0xff } }
+        self.init(combo: Chord(modifiers: held, keyName: name))
+    }
 
     var description: String {
         switch self {
@@ -31,6 +69,7 @@ enum KeySource: Hashable, CustomStringConvertible {
         case .key(let usage): return String(format: "key:%02x", usage)
         case .button(let bit): return "btn:\(bit)"
         case .wheel(let up): return up ? "wheel:up" : "wheel:down"
+        case .combo(let bits, let usage): return chord?.description ?? String(format: "combo:%x:%02x", bits, usage)
         }
     }
 
@@ -44,6 +83,39 @@ enum KeySource: Hashable, CustomStringConvertible {
         case "wheel": guard ["up", "down"].contains(parts[1]) else { return nil }; self = .wheel(up: parts[1] == "up")
         default: return nil
         }
+    }
+}
+
+/// What "pick a key" makes of the keys pressed on a keyboard: a key by itself, or — pressed
+/// with modifiers held — the combination. A modifier pressed and let go alone is that key.
+struct KeyPick {
+    enum Outcome: Equatable {
+        case picked(KeySource)
+        /// A modifier is down: it may be the start of a combination.
+        case waiting
+        /// Nothing to do with the pick: a key that was down before it began, coming up.
+        case notItsOwn
+    }
+
+    /// The modifier keys held since the pick began.
+    private var held: [UInt8] = []
+    /// The first of them to go down.
+    private var first: UInt8?
+
+    /// Takes an ordinary key going down or coming up, by its usage.
+    mutating func take(_ usage: UInt8, pressed: Bool) -> Outcome {
+        let isModifier = (0xe0...0xe7).contains(usage)
+        if pressed && isModifier {
+            if held.isEmpty { first = usage }
+            held.append(usage)
+            return .waiting
+        }
+        if pressed { return .picked(KeySource(combo: usage, modifierKeys: held) ?? .key(usage)) }
+        guard let index = held.firstIndex(of: usage) else { return .notItsOwn }
+        held.remove(at: index)
+        // All let go with nothing else pressed: a modifier key itself was meant, the first of them.
+        guard held.isEmpty, let first else { return .waiting }
+        return .picked(.key(first))
     }
 }
 
@@ -68,7 +140,7 @@ struct Trigger: Hashable, CustomStringConvertible {
         self.source = source
     }
 
-    /// "keyboard.M1", "keyboard.capslock", "mouse.7", "mouse.raw:20"
+    /// "keyboard.M1", "keyboard.capslock", "keyboard.cmd+q", "mouse.7", "mouse.raw:20"
     init(parsing text: String) throws {
         guard let dot = text.firstIndex(of: "."), let kind = DeviceKind(configName: String(text[..<dot])) else {
             throw ConfigError("\"\(text)\": expected \"keyboard.<key>\" or \"mouse.<button>\"")
@@ -80,8 +152,10 @@ struct Trigger: Hashable, CustomStringConvertible {
             self.init(kind: kind, source: source)
         } else if kind == .keyboard, let usage = KeyboardKeys.usage(named: name) {
             self.init(kind: kind, source: .key(usage))
+        } else if kind == .keyboard, let source = (try? Chord(name)).flatMap(KeySource.init(combo:)) {
+            self.init(kind: kind, source: source)
         } else {
-            let known = KeyNames.table(for: kind).map(\.0).joined(separator: ", ") + (kind == .keyboard ? ", any key by name (capslock, a, left-cmd…)" : "")
+            let known = KeyNames.table(for: kind).map(\.0).joined(separator: ", ") + (kind == .keyboard ? ", any key by name (capslock, a, left-cmd…), a key with modifiers (cmd+q)" : "")
             throw ConfigError("\"\(text)\": unknown \(kind.rawValue) key \"\(name)\" (known: \(known), or raw:XX / key:XX / btn:N / wheel:up|down)")
         }
     }
